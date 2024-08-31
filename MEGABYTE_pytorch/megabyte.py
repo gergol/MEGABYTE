@@ -21,9 +21,9 @@ from tqdm import tqdm
 
 
 def inspect_shapes(prefix, **tensors):
-    # shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items()]
-    # print(f"inspect_shapes {prefix}: {shapes}")
-    pass
+    if False:
+        shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items()]
+        print(f"inspect_shapes {prefix}: {shapes}")
 
 
 def exists(val):
@@ -170,7 +170,7 @@ class Attention(nn.Module):
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
 
-        inspect_shapes("before attend: ", q=q, k=k, v=v)
+        # inspect_shapes("before attend: ", q=q, k=k, v=v)
         out = self.attend(q, k, v)
 
         out = rearrange(out, "b h n d -> b n (h d)")
@@ -343,7 +343,7 @@ class MEGABYTE(nn.Module):
             self.to_next_transformer_projections.append(proj)
             first_layer = False
 
-        self.to_logits = nn.Linear(fine_dim, vocab_size)
+        self.lm_head = nn.Linear(fine_dim, vocab_size)
         self.pad_id = pad_token_id
 
     def generate(self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1):
@@ -385,9 +385,9 @@ class MEGABYTE(nn.Module):
             prev_stage_tokens_repr = proj(tokens)
             first_stage = False
 
-        return self.to_logits(tokens)
+        return self.lm_head(tokens)
 
-    def forward(self, ids, return_loss=False, encoder_hidden_states=None):
+    def forward(self, ids, return_loss=False, encoder_hidden_states=None, **kwargs):
         batch = ids.shape[0]
 
         inspect_shapes("MEGABYTE", ids=ids)
@@ -479,20 +479,23 @@ class MEGABYTE(nn.Module):
 
             # project for next stage in the hierarchy
 
+            inspect_shapes("MEGABYTE pre proj", x=attended)
+            # TODO: the projection output of the last stage is not being used
+            # check if this is intended or not? If it is, remover this unnecessary calculation
             prev_stage_tokens_repr = proj(attended[..., :-1, :])
             inspect_shapes("MEGABYTE post proj", x=prev_stage_tokens_repr)
             first_stage = False
 
         # project to logits
 
-        logits = self.to_logits(attended)
+        logits = self.lm_head(attended)
         inspect_shapes("MEGABYTE logits", logits=logits)
 
         start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
         start_tokens = rearrange(start_tokens, "b d -> b 1 d")
 
         logits = logits[..., 1:, :]
-
+        inspect_shapes("MEGABYTE logits before rearrange", logits=logits)
         if not return_loss:
 
             if flattened_dims:
@@ -503,11 +506,26 @@ class MEGABYTE(nn.Module):
             return logits
 
         logits = rearrange(logits, "b ... c -> b (...) c")
-        logits = torch.cat((start_tokens, logits), dim=-2)
+        inspect_shapes("Pre add start tokens: ", logits=logits)
+        inspect_shapes("Start tokens: ", start_tokens=start_tokens)
+        # logits = torch.cat((start_tokens, logits), dim=-2)
+        inspect_shapes("Post add start tokens: ", logits=logits)
 
         preds = rearrange(logits, "b n c -> b c n")
         labels = rearrange(ids, "b ... -> b (...)")
+        inspect_shapes("MEGABYTE pre loss", preds=preds, labels=labels)
+        loss = F.cross_entropy(preds, labels, ignore_index=self.pad_id)
+        # loss = F.cross_entropy(preds[..., 1:], labels[..., :-1], ignore_index=self.pad_id)
 
-        loss = F.cross_entropy(preds[..., :-1], labels, ignore_index=self.pad_id)
-
-        return loss, logits
+        # This part of the code comes from the GPT2 implementation in transformers
+        # I added this because I wanted to check if their way of shaping labels and preds is different
+        # labels = ids.to(logits.device)
+        # # Shift so that tokens < n predict n
+        # shift_logits = logits.contiguous()
+        # shift_labels = labels.contiguous()
+        # # shift_logits = logits[..., :-1, :].contiguous()
+        # # shift_labels = labels[..., 1:].contiguous()
+        # # Flatten the tokens
+        # loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.pad_id)
+        # loss2 = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        return logits, loss  # , loss2

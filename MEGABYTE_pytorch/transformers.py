@@ -2,8 +2,9 @@ import os
 
 import torch
 import torch.nn.functional as F
-from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
-from transformers.modeling_outputs import CausalLMOutput
+from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin, AutoModel, AutoConfig
+from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithCrossAttentions
+
 from dataclasses import dataclass
 
 from typing import Optional, List, Tuple, Union
@@ -17,15 +18,15 @@ class MegabyteConfig(PretrainedConfig):
     def __init__(
         self,
         *,
-        vocab_size: int,
-        hidden_sizes: List[int],
-        num_hidden_layers: List[int],
-        max_sequence_lengths: List[int],
+        vocab_size: int = 256,
+        hidden_sizes: List[int] = [768, 256],
+        num_hidden_layers: List[int] = [12, 8],
+        max_sequence_lengths: List[int] = [1024, 8],
         dim_head: int = 64,
         num_heads: int = 8,
         attention_dropout_prob: float = 0.1,
         feed_forward_scaleup: int = 4,
-        feed_forward_dropout_prob: float = 0.0,
+        feed_forward_dropout_prob: float = 0.1,
         rel_pos: bool = False,
         pos_emb: bool = False,
         flash_attn: bool = False,
@@ -35,6 +36,8 @@ class MegabyteConfig(PretrainedConfig):
         eos_token_id: Optional[int] = 2,
         **kwargs
     ):
+
+        super().__init__(**kwargs, bos_token_id=bos_token_id, eos_token_id=eos_token_id)
 
         self.vocab_size: int = vocab_size
         self.hidden_sizes: List[int] = hidden_sizes
@@ -54,7 +57,9 @@ class MegabyteConfig(PretrainedConfig):
         self.eos_token_id: int = eos_token_id or bos_token_id
         self.is_encoder_decoder = False
 
-        super().__init__(**kwargs, bos_token_id=bos_token_id, eos_token_id=eos_token_id)
+    @property
+    def hidden_size(self):
+        return self.hidden_sizes[0]
 
 
 class MegabyteLMHeadModel(PreTrainedModel, GenerationMixin):
@@ -78,14 +83,28 @@ class MegabyteLMHeadModel(PreTrainedModel, GenerationMixin):
             add_cross_attention=config.add_cross_attention,
             pad_token_id=config.pad_token_id,
         )
+        self.config = config
 
-    def forward(self, input_ids, encoder_hidden_states: Optional[torch.Tensor] = None, return_dict=False):
+    def forward(self, input_ids, encoder_hidden_states: Optional[torch.Tensor] = None, return_dict=False, **kwargs):
 
-        loss, logits = self.model(input_ids, encoder_hidden_states=encoder_hidden_states, return_loss=True)
+        logits, loss = self.model(input_ids, encoder_hidden_states=encoder_hidden_states, return_loss=True, **kwargs)
         if not return_dict:
-            return loss
+            return logits, loss
+        if self.config.add_cross_attention:
+            # TODO fill out the remaining constructor args
+            return CausalLMOutputWithCrossAttentions(
+                loss=loss,
+                logits=logits,
+                hidden_states=None,
+                attentions=None,
+                past_key_values=None,
+                cross_attentions=None,
+            )
         return CausalLMOutput(loss=loss, logits=logits, hidden_states=None, attentions=None)
 
+
+AutoConfig.register("megabyte", MegabyteConfig)
+AutoModel.register(MegabyteConfig, MegabyteLMHeadModel)
 
 # class MegabyteTokenizer:
 #     def __init__(self, pad_token_id=0, bos_token_id=1, eos_token_id=2):
