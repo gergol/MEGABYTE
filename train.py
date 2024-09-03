@@ -11,16 +11,26 @@ from torch.utils.data import DataLoader, Dataset
 import math
 
 # constants
-
+#
+# NUM_BATCHES = int(1e5) // 3
+# BATCH_SIZE = 4 * 3
+# GRADIENT_ACCUMULATE_EVERY = 4
+# LEARNING_RATE = 2e-4 * math.sqrt(3)
+# VALIDATE_EVERY = 100
+# GENERATE_EVERY = 100
+# PRIME_LEN = 100
+# SEQ_LEN = 8192
+# ADD_CROSS_ATTENTION = True
+#
 NUM_BATCHES = int(1e5) // 3
 BATCH_SIZE = 4 * 3
 GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 2e-4 * math.sqrt(3)
+LEARNING_RATE = 2e-4
 VALIDATE_EVERY = 100
 GENERATE_EVERY = 100
 PRIME_LEN = 100
-SEQ_LEN = 8192
-ADD_CROSS_ATTENTION = True
+SEQ_LEN = 128
+ADD_CROSS_ATTENTION = False
 
 # helpers
 
@@ -40,18 +50,40 @@ def decode_tokens(tokens):
 
 
 # instantiate GPT-like decoder model
+#
 
-model = MEGABYTE(vocab_size=256, dim=(768, 512, 256), depth=(6, 4, 2), max_seq_len=(512, 4, 4), flash_attn=True, add_cross_attention=ADD_CROSS_ATTENTION).cuda()
+# vocab_size: int,
+# hidden_sizes: List[int],
+# num_hidden_layers: List[int],
+# max_sequence_lengths: List[int],
+# dim_head: int = 64,
+# num_heads: int = 8,
+# model = MEGABYTE(vocab_size=256, dim=(768, 512, 256), depth=(6, 4, 2), max_seq_len=(512, 4, 4), flash_attn=True, add_cross_attention=ADD_CROSS_ATTENTION).cuda()
+model = MEGABYTE(
+    vocab_size=256,
+    hidden_sizes=(512, 256),
+    num_hidden_layers=(6, 4),
+    max_sequence_lengths=(16, 8),
+    flash_attn=True,
+    add_cross_attention=ADD_CROSS_ATTENTION,
+).cuda()
 
-encoder_hidden_states = torch.rand(BATCH_SIZE, 1201, 768).cuda() if ADD_CROSS_ATTENTION else None
+# encoder_hidden_states = torch.rand(BATCH_SIZE, 1201, 768).cuda() if ADD_CROSS_ATTENTION else None
+encoder_hidden_states = None
 
 
 # prepare enwik8 data
 
-with gzip.open("./data/enwik8.gz") as file:
+with gzip.open("./data/plants.txt.gz") as file:
     x = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
     train_x, valid_x = np.split(x, [int(90e6)])
     data_train, data_val = map(torch.from_numpy, (train_x, valid_x))
+    # platns quick dataset has not validation data
+    data_val = data_train
+# with gzip.open("./data/enwik8.gz") as file:
+#     x = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+#     train_x, valid_x = np.split(x, [int(90e6)])
+#     data_train, data_val = map(torch.from_numpy, (train_x, valid_x))
 
 
 class TextSamplerDataset(Dataset):
