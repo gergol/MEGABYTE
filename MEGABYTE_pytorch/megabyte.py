@@ -346,7 +346,7 @@ class MEGABYTE(nn.Module):
         self.lm_head = nn.Linear(fine_dim, vocab_size)
         self.pad_id = pad_token_id
 
-    def generate(self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1, encoder_hidden_states=None):
+    def generate(self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1):
         total_seq_len = reduce_mult(self.max_seq_len)
         device = next(self.parameters()).device
 
@@ -357,7 +357,7 @@ class MEGABYTE(nn.Module):
         batch = seq.shape[0]
 
         for _ in tqdm(range(total_seq_len - seq.shape[-1])):
-            logits = self.forward(seq, encoder_hidden_states=encoder_hidden_states)[:, -1]
+            logits = self.forward(seq)[:, -1]
             logits = top_k(logits, thres=filter_thres)
             sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
             seq = torch.cat((seq, rearrange(sampled, "b -> b 1")), dim=-1)
