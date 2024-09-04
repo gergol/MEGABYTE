@@ -162,3 +162,5 @@ data
 lightning_logs
 test_only_model.pt
 text_only_model.pt
+Untitled.ipynb
+vision_text_model.pt

@@ -158,7 +158,7 @@ class Attention(nn.Module):
 
     def forward(self, x, rotary_emb=None, encoder_hidden_states=None):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
-        h, device = self.heads, x.device
+        h = self.heads
         x = self.norm(x)
         if self.is_cross_attention:
             q, k, v = (self.to_q(x), *self.to_kv(encoder_hidden_states).chunk(2, dim=-1))
@@ -168,7 +168,7 @@ class Attention(nn.Module):
 
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
-        
+
         inspect_shapes("before attend: ", q=q, k=k, v=v)
         out = self.attend(q, k, v)
 
