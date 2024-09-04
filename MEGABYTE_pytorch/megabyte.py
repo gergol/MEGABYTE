@@ -274,7 +274,7 @@ class MEGABYTE(nn.Module):
 
         self.stages = len(num_hidden_layers)
         hidden_sizes = cast_tuple(hidden_sizes, self.stages)
-
+        self.hidden_sizes = hidden_sizes
         assert len(hidden_sizes) == self.stages
 
         coarsest_dim, *_, fine_dim = hidden_sizes

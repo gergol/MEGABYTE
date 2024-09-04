@@ -26,19 +26,24 @@ class VisionEncoderDecoderModel(L.LightningModule):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self._device = device or encoder.device
-        self.encoder = encoder.to(device)
-        self.decoder = decoder.to(device)
+        self.encoder = encoder
+        self.decoder = decoder
         self.optimizer_class = optimizer
         self.schduler_class = scheduler
         self.lr = lr
-        # assert self.encoder.device == self._device
+        if self.encoder.config.hidden_size != self.decoder.hidden_sizes[0]:
+            self.enc_to_dec_proj = nn.Linear(self.encoder.config.hidden_size, self.decoder.hidden_sizes[0])
+        else:
+            self.enc_to_dec_proj = None
 
     def forward(self, pixel_values=None, input_ids=None, return_loss=False, encoder_hidden_states=None):
         if encoder_hidden_states is None:
-            image_embedidngs = self.encoder(pixel_values=pixel_values).last_hidden_state
+            image_embeddings = self.encoder(pixel_values=pixel_values).last_hidden_state
         else:
-            image_embedidngs = encoder_hidden_states
-        out = self.decoder(input_ids, encoder_hidden_states=image_embedidngs, return_loss=return_loss)
+            image_embeddings = encoder_hidden_states
+        if self.enc_to_dec_proj is not None:
+            image_embeddings = self.enc_to_dec_proj(image_embeddings)
+        out = self.decoder(input_ids, encoder_hidden_states=image_embeddings, return_loss=return_loss)
         return out
 
     def training_step(self, batch_dict, batch_idx):
