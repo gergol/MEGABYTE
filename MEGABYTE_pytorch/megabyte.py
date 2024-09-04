@@ -244,49 +244,49 @@ class Transformer(nn.Module):
 
 class MEGABYTE(nn.Module):
 
-    @beartype
     def __init__(
         self,
         *,
-        vocab_size,
-        dim: Union[Tuple, int],
-        depth: Tuple,
-        max_seq_len: Tuple,
-        dim_head=64,
-        heads=8,
-        attn_dropout=0.0,
-        ff_mult=4,
-        ff_dropout=0.0,
-        pad_id=0,
-        rel_pos=False,
-        pos_emb=False,
-        flash_attn=False,
-        add_cross_attention=False,
+        vocab_size: int,
+        hidden_sizes: List[int],
+        num_hidden_layers: List[int],
+        max_sequence_lengths: List[int],
+        dim_head: int = 64,
+        num_heads: int = 8,
+        attention_dropout_prob: float = 0.1,
+        feed_forward_scaleup: int = 4,
+        feed_forward_dropout_prob: float = 0.0,
+        pad_token_id: int = 0,
+        eos_token_id: int = None,
+        bos_token_id: int = None,
+        rel_pos: bool = False,
+        pos_emb: bool = False,
+        flash_attn: bool = False,
+        add_cross_attention: bool = False,
     ):
         super().__init__()
 
         # simplified configuration for each stage of the hierarchy
         # depth = (2, 2, 4) would translate to depth 2 at first stage, depth 2 second stage, depth 4 third
-        # max_seq_len = (16, 8, 4) would translate to max sequence length of 16 at first stage, length of 8 at second stage, length of 4 for last
+        # max_sequence_lengths = (16, 8, 4) would translate to max sequence length of 16 at first stage, length of 8 at second stage, length of 4 for last
 
-        assert isinstance(depth, tuple) and isinstance(max_seq_len, tuple)
-        assert len(depth) == len(max_seq_len)
+        assert len(num_hidden_layers) == len(max_sequence_lengths)
 
-        self.stages = len(depth)
-        dim = cast_tuple(dim, self.stages)
+        self.stages = len(num_hidden_layers)
+        hidden_sizes = cast_tuple(hidden_sizes, self.stages)
 
-        assert len(dim) == self.stages
+        assert len(hidden_sizes) == self.stages
 
-        coarsest_dim, *_, fine_dim = dim
+        coarsest_dim, *_, fine_dim = hidden_sizes
 
-        self.max_seq_len = max_seq_len
+        self.max_sequence_lengths = max_sequence_lengths
         self.add_cross_attention = add_cross_attention
 
         self.start_tokens = nn.ParameterList(
-            [nn.Parameter(torch.randn(h_dim)) for h_dim, seq_len in zip(dim, max_seq_len)]
+            [nn.Parameter(torch.randn(h_dim)) for h_dim, seq_len in zip(hidden_sizes, max_sequence_lengths)]
         )
         self.pos_embs = (
-            nn.ModuleList([nn.Embedding(seq_len, h_dim) for h_dim, seq_len in zip(dim, max_seq_len)])
+            nn.ModuleList([nn.Embedding(seq_len, h_dim) for h_dim, seq_len in zip(hidden_sizes, max_sequence_lengths)])
             if pos_emb
             else None
         )
@@ -296,7 +296,7 @@ class MEGABYTE(nn.Module):
         patch_size = 1
         self.token_embs.append(nn.Embedding(vocab_size, fine_dim))
 
-        for dim_out, seq_len in zip(reversed(dim[:-1]), reversed(max_seq_len[1:])):
+        for dim_out, seq_len in zip(reversed(hidden_sizes[:-1]), reversed(max_sequence_lengths[1:])):
             patch_size *= seq_len
 
             self.token_embs.append(
@@ -313,16 +313,18 @@ class MEGABYTE(nn.Module):
         self.to_next_transformer_projections = nn.ModuleList([])
 
         first_layer = True
-        for h_dim, next_h_dim, stage_depth, next_seq_len in zip_longest(dim, dim[1:], depth, max_seq_len[1:]):
+        for h_dim, next_h_dim, stage_depth, next_seq_len in zip_longest(
+            hidden_sizes, hidden_sizes[1:], num_hidden_layers, max_sequence_lengths[1:]
+        ):
             self.transformers.append(
                 Transformer(
                     dim=h_dim,
                     layers=stage_depth,
                     dim_head=dim_head,
-                    heads=heads,
-                    attn_dropout=attn_dropout,
-                    ff_dropout=ff_dropout,
-                    ff_mult=ff_mult,
+                    heads=num_heads,
+                    attn_dropout=attention_dropout_prob,
+                    ff_dropout=feed_forward_dropout_prob,
+                    ff_mult=feed_forward_scaleup,
                     rel_pos=rel_pos,
                     flash_attn=flash_attn,
                     has_cross_attention=self.add_cross_attention and first_layer,
@@ -331,7 +333,7 @@ class MEGABYTE(nn.Module):
 
             proj = nn.Identity()
 
-            if exists(next_h_dim) and next_h_dim != dim:
+            if exists(next_h_dim) and next_h_dim != hidden_sizes:
                 proj = nn.Sequential(
                     Rearrange("b ... d -> b (...) d"),
                     nn.Linear(h_dim, next_h_dim * next_seq_len),
@@ -342,10 +344,10 @@ class MEGABYTE(nn.Module):
             first_layer = False
 
         self.to_logits = nn.Linear(fine_dim, vocab_size)
-        self.pad_id = pad_id
+        self.pad_token_id = pad_token_id
 
     def generate(self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1):
-        total_seq_len = reduce_mult(self.max_seq_len)
+        total_seq_len = reduce_mult(self.max_sequence_lengths)
         device = next(self.parameters()).device
 
         if prime is None:
@@ -360,7 +362,7 @@ class MEGABYTE(nn.Module):
             sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
             seq = torch.cat((seq, rearrange(sampled, "b -> b 1")), dim=-1)
 
-        return seq.reshape(batch, *self.max_seq_len)
+        return seq.reshape(batch, *self.max_sequence_lengths)
 
     def forward_empty(self, batch_size):
         # take care of special case
@@ -391,7 +393,6 @@ class MEGABYTE(nn.Module):
         ), "encoder_hidden_states are expected if and only if self.add_cross_attention == True"
 
         flattened_dims = ids.ndim == 2
-        ids_orig_ndim = ids.ndim
 
         if ids.numel() == 0:
             return self.forward_empty(ids.shape[0])
@@ -400,19 +401,21 @@ class MEGABYTE(nn.Module):
             # allow for ids to be given in the shape of (batch, seq)
             # in which case it will be auto-padded to the next nearest multiple of depth seq len
             seq_len = ids.shape[-1]
-            multiple_of = reduce_mult(self.max_seq_len[1:])
+            multiple_of = reduce_mult(self.max_sequence_lengths[1:])
             padding = remainder_to_mult(seq_len, multiple_of)
-            ids = F.pad(ids, (0, padding), value=self.pad_id)
-            ids = ids.reshape(batch, -1, *self.max_seq_len[1:])
+            ids = F.pad(ids, (0, padding), value=self.pad_token_id)
+            ids = ids.reshape(batch, -1, *self.max_sequence_lengths[1:])
 
         b, *prec_dims, device = *ids.shape, ids.device
 
         # check some dimensions
 
         assert (
-            prec_dims[0] <= self.max_seq_len[0]
-        ), "the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_seq_len (like any autoregressive transformer)"
-        assert tuple(prec_dims[1:]) == tuple(self.max_seq_len[1:]), "all subsequent dimensions must match exactly"
+            prec_dims[0] <= self.max_sequence_lengths[0]
+        ), "the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_sequence_lengths (like any autoregressive transformer)"
+        assert tuple(prec_dims[1:]) == tuple(
+            self.max_sequence_lengths[1:]
+        ), "all subsequent dimensions must match exactly"
 
         # get tokens for all hierarchical stages, reducing by appropriate dimensions
         # and adding the absolute positional embeddings
@@ -502,6 +505,6 @@ class MEGABYTE(nn.Module):
         preds = rearrange(logits, "b n c -> b c n")
         labels = rearrange(ids, "b ... -> b (...)")
 
-        loss = F.cross_entropy(preds[..., :-1], labels, ignore_index=self.pad_id)
+        loss = F.cross_entropy(preds[..., :-1], labels, ignore_index=self.pad_token_id)
 
         return loss

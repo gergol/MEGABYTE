@@ -2,6 +2,7 @@ import lightning as L
 import torch
 import torch.nn as nn
 from typing import Optional
+from lightning.pytorch.cli import OptimizerCallable, LRSchedulerCallable
 
 
 class VisionEncoderDecoderModel(L.LightningModule):
@@ -14,11 +15,11 @@ class VisionEncoderDecoderModel(L.LightningModule):
         vocab_json_path=None,
         dataset_name=None,
         init_from_checkpoint_path: Optional[str] = None,
-        max_sequence_length=MAX_LEN,
         use_beam_search=False,
-        optimizer: L.OptimizerCallable = torch.optim.AdamW,
-        scheduler: L.LRSchedulerCallable = torch.optim.lr_scheduler.ConstantLR,
+        optimizer: OptimizerCallable = torch.optim.AdamW,
+        scheduler: LRSchedulerCallable = torch.optim.lr_scheduler.ConstantLR,
         device=None,
+        lr=2e-4,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["encoder", "decoder"])
@@ -27,6 +28,9 @@ class VisionEncoderDecoderModel(L.LightningModule):
         self._device = device or encoder.device
         self.encoder = encoder.to(device)
         self.decoder = decoder.to(device)
+        self.optimizer_class = optimizer
+        self.schduler_class = scheduler
+        self.lr = lr
         # assert self.encoder.device == self._device
 
     def forward(self, pixel_values=None, input_ids=None, return_loss=False, encoder_hidden_states=None):
@@ -53,4 +57,6 @@ class VisionEncoderDecoderModel(L.LightningModule):
         self.log("val_loss", loss, prog_bar=True, on_epoch=True)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(list(self.encoder.parameters()) + list(self.decoder.parameters()), lr=2e-4)
+        optimizer = self.optimizer_class(list(self.encoder.parameters()) + list(self.decoder.parameters()), lr=self.lr)
+        scheduler = self.schduler_class(optimizer)
+        return {"optimizer": optimizer, "lr_scheduler": scheduler, "metric": "val_loss"}
