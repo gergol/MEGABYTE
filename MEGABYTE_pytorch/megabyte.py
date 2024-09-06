@@ -364,12 +364,13 @@ class MEGABYTE(nn.Module):
 
         return seq.reshape(batch, *self.max_sequence_lengths)
 
-    def forward_empty(self, batch_size):
+    def forward_empty(self, batch_size, encoder_hidden_states=None):
         # take care of special case
         # where you sample from input of 0 (start token only)
 
         prev_stage_tokens_repr = None
-
+        
+        is_first_stage = True
         for stage_start_tokens, transformer, proj in zip(
             self.start_tokens, self.transformers, self.to_next_transformer_projections
         ):
@@ -377,8 +378,12 @@ class MEGABYTE(nn.Module):
 
             if prev_stage_tokens_repr is not None:
                 tokens = tokens + prev_stage_tokens_repr[..., : tokens.shape[-2], :]
-
-            tokens = transformer(tokens)
+            
+            if is_first_stage:
+                tokens = transformer(tokens, encoder_hidden_states=encoder_hidden_states)
+                is_first_stage = False
+            else:
+                tokens = transformer(tokens)
             prev_stage_tokens_repr = proj(tokens)
 
         return self.to_logits(tokens)
@@ -395,7 +400,7 @@ class MEGABYTE(nn.Module):
         flattened_dims = ids.ndim == 2
 
         if ids.numel() == 0:
-            return self.forward_empty(ids.shape[0])
+            return self.forward_empty(ids.shape[0], encoder_hidden_states=encoder_hidden_states)
 
         if flattened_dims:
             # allow for ids to be given in the shape of (batch, seq)
