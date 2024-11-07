@@ -369,7 +369,7 @@ class MEGABYTE(nn.Module):
         # where you sample from input of 0 (start token only)
 
         prev_stage_tokens_repr = None
-        
+
         is_first_stage = True
         for stage_start_tokens, transformer, proj in zip(
             self.start_tokens, self.transformers, self.to_next_transformer_projections
@@ -378,7 +378,7 @@ class MEGABYTE(nn.Module):
 
             if prev_stage_tokens_repr is not None:
                 tokens = tokens + prev_stage_tokens_repr[..., : tokens.shape[-2], :]
-            
+
             if is_first_stage:
                 tokens = transformer(tokens, encoder_hidden_states=encoder_hidden_states)
                 is_first_stage = False
@@ -388,7 +388,7 @@ class MEGABYTE(nn.Module):
 
         return self.to_logits(tokens)
 
-    def forward(self, ids, return_loss=False, encoder_hidden_states=None):
+    def forward(self, ids, return_loss=False, encoder_hidden_states=None, return_preds_and_labels=False):
         batch = ids.shape[0]
 
         inspect_shapes("MEGABYTE", ids=ids)
@@ -512,4 +512,6 @@ class MEGABYTE(nn.Module):
 
         loss = F.cross_entropy(preds[..., :-1], labels, ignore_index=self.pad_token_id)
 
+        if return_preds_and_labels:
+            return loss, preds, labels
         return loss
