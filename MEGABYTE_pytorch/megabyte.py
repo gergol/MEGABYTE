@@ -156,7 +156,7 @@ class Attention(nn.Module):
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-    def forward(self, x, rotary_emb=None, encoder_hidden_states=None):
+    def forward(self, x, rotary_emb=None, encoder_hidden_states=None, cache=None):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
         h = self.heads
         x = self.norm(x)
@@ -190,17 +190,34 @@ class Transformer(nn.Module):
         rel_pos=True,
         flash_attn=False,
         has_cross_attention=False,
+        use_old_layout=False,  # this is temporarily necessary because in previous versions the ordering of the cross attention and ff layers in the transformer was different. This is only an issue when trying to load an old checkpoint preceeding this change
     ):
         super().__init__()
         self.rotary_emb = RotaryEmbedding(dim_head) if rel_pos else None
         self.layers = nn.ModuleList([])
+        self.use_old_layout = use_old_layout
 
         for _ in range(layers):
             ll: List[nn.Module] = [
                 Attention(dim=dim, dim_head=dim_head, heads=heads, dropout=attn_dropout, flash=flash_attn),
             ]
+            if use_old_layout and has_cross_attention:
+                # in the old layout, the cross attention layers were located at this position
+                # so we need to keep this option if we want to load an old layout checkpoint
+                ll.append(
+                    Attention(
+                        dim=dim,
+                        dim_head=dim_head,
+                        heads=heads,
+                        dropout=attn_dropout,
+                        flash=flash_attn,
+                        is_cross_attention=True,
+                    ),
+                )
             ll.append(FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout))
-            if has_cross_attention:
+            if not use_old_layout and has_cross_attention:
+                # now, the cross attention is here, so that we can initialize the model from checkpoints
+                # that do not have cross attention layers at all...
                 ll.append(
                     Attention(
                         dim=dim,
@@ -223,6 +240,8 @@ class Transformer(nn.Module):
 
         if self.has_cross_attention:
             for attn, ff, cross_attn in self.layers:
+                if self.use_old_layout:
+                    cross_attn, ff = ff, cross_attn  # swap the variable names to match the old layout if needed
                 # for attn, cross_attn, ff in self.layers:
                 x = attn(token_shift(x), rotary_emb=rotary_emb) + x
                 inspect_shapes("Transformer post attn", x=x)
@@ -264,6 +283,7 @@ class MEGABYTE(nn.Module):
         pos_emb: bool = False,
         flash_attn: bool = False,
         add_cross_attention: bool = False,
+        use_old_layout: bool = False,  # this is temporarily necessary because in previous versions the ordering of the cross attention and ff layers in the transformer was different. This is only an issue when trying to load an old checkpoint preceeding this change
     ):
         super().__init__()
 
@@ -329,6 +349,7 @@ class MEGABYTE(nn.Module):
                     rel_pos=rel_pos,
                     flash_attn=flash_attn,
                     has_cross_attention=self.add_cross_attention and first_layer,
+                    use_old_layout=use_old_layout,
                 )
             )
 
