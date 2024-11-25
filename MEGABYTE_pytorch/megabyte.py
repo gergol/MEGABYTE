@@ -199,6 +199,7 @@ class Transformer(nn.Module):
             ll: List[nn.Module] = [
                 Attention(dim=dim, dim_head=dim_head, heads=heads, dropout=attn_dropout, flash=flash_attn),
             ]
+            ll.append(FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout))
             if has_cross_attention:
                 ll.append(
                     Attention(
@@ -210,7 +211,6 @@ class Transformer(nn.Module):
                         is_cross_attention=True,
                     ),
                 )
-            ll.append(FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout))
             self.layers.append(nn.ModuleList(ll))
 
         self.norm = RMSNorm(dim)
@@ -222,7 +222,8 @@ class Transformer(nn.Module):
         rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None
 
         if self.has_cross_attention:
-            for attn, cross_attn, ff in self.layers:
+            for attn, ff, cross_attn in self.layers:
+                # for attn, cross_attn, ff in self.layers:
                 x = attn(token_shift(x), rotary_emb=rotary_emb) + x
                 inspect_shapes("Transformer post attn", x=x)
                 x = cross_attn(token_shift(x), rotary_emb=rotary_emb, encoder_hidden_states=encoder_hidden_states) + x
