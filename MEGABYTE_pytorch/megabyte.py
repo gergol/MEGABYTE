@@ -2,6 +2,7 @@ import math
 import functools
 from itertools import zip_longest
 
+import time
 import torch
 import torch.nn.functional as F
 from torch import nn, einsum
@@ -10,18 +11,34 @@ from einops import rearrange, reduce, repeat, pack, unpack
 from einops.layers.torch import Rearrange
 
 from beartype import beartype
-from beartype.typing import Tuple, Union, List
+from beartype.typing import Tuple, Union, List, Optional, Dict
 
 from MEGABYTE_pytorch.attend import Attend
 
 from tqdm import tqdm
+import pprint
 
 # helpers
 
 
 def inspect_shapes(prefix, **tensors):
-    # shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items()]
-    # print(f"inspect_shapes {prefix}: {shapes}")
+    if True:
+        return
+    shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items()]
+    import numpy as np
+
+    np.set_printoptions(precision=2)
+    print(f"{prefix}: {shapes}")
+    # vals = [f"{k}={tuple(x for x in v.cpu().numpy())}" for k, v in tensors.items()]
+    vals = {k: str(hash(str(v.cpu().numpy())))[-5:] for k, v in tensors.items()}
+    # vals = []
+    # import numpy as np
+    # for k, v in tensors.items():
+    #     val = ""
+    #     for x in v.cpu().numpy():
+    #         val += f"{x}"
+    #     vals.append(f"{k}={val}")
+    pprint.pp((f"values: {prefix}:", vals))
     pass
 
 
@@ -169,7 +186,7 @@ class Attention(nn.Module):
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
 
-        inspect_shapes("before attend: ", q=q, k=k, v=v)
+        # inspect_shapes("before attend: ", q=q, k=k, v=v)
         out = self.attend(q, k, v)
 
         out = rearrange(out, "b h n d -> b n (h d)")
@@ -244,17 +261,17 @@ class Transformer(nn.Module):
                     cross_attn, ff = ff, cross_attn  # swap the variable names to match the old layout if needed
                 # for attn, cross_attn, ff in self.layers:
                 x = attn(token_shift(x), rotary_emb=rotary_emb) + x
-                inspect_shapes("Transformer post attn", x=x)
+                # inspect_shapes("Transformer post attn", x=x)
                 x = cross_attn(token_shift(x), rotary_emb=rotary_emb, encoder_hidden_states=encoder_hidden_states) + x
-                inspect_shapes("Transformer post cross attn", x=x)
+                # inspect_shapes("Transformer post cross attn", x=x)
                 x = ff(token_shift(x)) + x
-                inspect_shapes("Transformer post ff", x=x)
+                # inspect_shapes("Transformer post ff", x=x)
         else:
             for attn, ff in self.layers:
                 x = attn(token_shift(x), rotary_emb=rotary_emb) + x
-                inspect_shapes("Transformer post attn", x=x)
+                # inspect_shapes("Transformer post attn", x=x)
                 x = ff(token_shift(x)) + x
-                inspect_shapes("Transformer post ff", x=x)
+                # inspect_shapes("Transformer post ff", x=x)
 
         return self.norm(x)
 
@@ -386,15 +403,24 @@ class MEGABYTE(nn.Module):
 
         return seq.reshape(batch, *self.max_sequence_lengths)
 
-    def forward_empty(self, batch_size, encoder_hidden_states=None):
+    @property
+    def depth(self):
+        return len(self.max_sequence_lengths)
+
+    def forward_empty(self, batch_size, encoder_hidden_states=None, use_cache=False, cache=None):
         # take care of special case
         # where you sample from input of 0 (start token only)
 
         prev_stage_tokens_repr = None
 
         is_first_stage = True
-        for stage_start_tokens, transformer, proj in zip(
-            self.start_tokens, self.transformers, self.to_next_transformer_projections
+        if use_cache:
+            assert cache is not None
+            assert len(cache["kv"]) == len(self.transformers), "kv cache has incorrect size"
+            assert cache["hidden_states"] is not None
+
+        for stage_idx, stage_start_tokens, transformer, proj in zip(
+            range(self.depth), self.start_tokens, self.transformers, self.to_next_transformer_projections
         ):
             tokens = repeat(stage_start_tokens, "d -> b 1 d", b=batch_size)
 
@@ -407,11 +433,24 @@ class MEGABYTE(nn.Module):
             else:
                 tokens = transformer(tokens)
             prev_stage_tokens_repr = proj(tokens)
+            if use_cache and stage_idx < self.depth - 1:
+                cache["hidden_states"][stage_idx] = prev_stage_tokens_repr
 
-        return self.to_logits(tokens)
+        if use_cache:
+            return self.to_logits(tokens), cache  # type: ignore
+        return self.to_logits(tokens)  # type: ignore
 
-    def forward(self, ids, return_loss=False, encoder_hidden_states=None, return_preds_and_labels=False):
+    def forward(
+        self,
+        ids,
+        return_loss=False,
+        encoder_hidden_states=None,
+        return_preds_and_labels=False,
+        use_cache=False,
+        cache: Optional[Dict] = None,
+    ):
         batch = ids.shape[0]
+        N = ids.shape[1]
 
         inspect_shapes("MEGABYTE", ids=ids)
         assert ids.ndim in {2, self.stages + 1}
@@ -419,10 +458,24 @@ class MEGABYTE(nn.Module):
             encoder_hidden_states is not None
         ), "encoder_hidden_states are expected if and only if self.add_cross_attention == True"
 
+        assert not use_cache or self.depth == 2, "cache is only implemented for two-layer MEGABYTE models"
+        assert (
+            not use_cache or len(ids.shape) == 2 and batch == 1
+        ), "caching is curently only supported for batch size == 1"
+
         flattened_dims = ids.ndim == 2
 
+        if use_cache and cache is None:
+            cache = {}
+            cache["kv"] = [[]] * len(self.transformers)
+            cache["hidden_states"] = [None] * (self.depth - 1)
+
+        do_profile = cache is not None and "profile" in cache
+
         if ids.numel() == 0:
-            return self.forward_empty(ids.shape[0], encoder_hidden_states=encoder_hidden_states)
+            return self.forward_empty(
+                ids.shape[0], encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
+            )
 
         if flattened_dims:
             # allow for ids to be given in the shape of (batch, seq)
@@ -450,8 +503,8 @@ class MEGABYTE(nn.Module):
         tokens_at_stages = []
         pos_embs = default(self.pos_embs, (None,))
 
-        for ind, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
-            is_first = ind == 0
+        for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
+            is_first = stage_idx == 0
 
             tokens = token_emb(ids)
 
@@ -472,14 +525,31 @@ class MEGABYTE(nn.Module):
 
         # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
         first_stage = True
-        for stage_start_tokens, stage_tokens, transformer, proj in zip(
-            self.start_tokens, tokens_at_stages, self.transformers, self.to_next_transformer_projections
+        for stage_idx, stage_start_tokens, stage_tokens, transformer, proj in zip(
+            range(self.depth),
+            self.start_tokens,
+            tokens_at_stages,
+            self.transformers,
+            self.to_next_transformer_projections,
         ):
+            if do_profile:
+                start_time = time.time()
+            if use_cache and stage_idx < len(cache["hidden_states"]):
+                hs = cache["hidden_states"][stage_idx]
+                # for networks with higer depth, we need to change this by the product of the subsequent layers
+                scale_factor = self.max_sequence_lengths[1]
+                if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
+                    # we have cached values for the current step, so we can skip that forward pass
+                    prev_stage_tokens_repr = hs
+                    if do_profile:
+                        cache["profile"][stage_idx].append(time.time() - start_time)
+                    continue
+                # if hs is not None:
+
             stage_tokens, ps = pack_one(stage_tokens, "* n d")
             stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
 
             # concat start token
-
             stage_tokens = torch.cat(
                 (
                     stage_start_tokens,
@@ -489,7 +559,6 @@ class MEGABYTE(nn.Module):
             )
 
             # sum the previous hierarchy's representation
-
             if exists(prev_stage_tokens_repr):
                 prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
                 stage_tokens = stage_tokens + prev_stage_tokens_repr
@@ -504,13 +573,15 @@ class MEGABYTE(nn.Module):
             # project for next stage in the hierarchy
 
             prev_stage_tokens_repr = proj(attended[..., :-1, :])
-            inspect_shapes("MEGABYTE post proj", x=prev_stage_tokens_repr)
+            if use_cache and stage_idx < self.depth - 1:
+                cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
             first_stage = False
+            if do_profile:
+                cache["profile"][stage_idx].append(time.time() - start_time)
 
         # project to logits
 
         logits = self.to_logits(attended)
-        inspect_shapes("MEGABYTE logits", logits=logits)
 
         start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
         start_tokens = rearrange(start_tokens, "b d -> b 1 d")
@@ -523,7 +594,8 @@ class MEGABYTE(nn.Module):
                 logits = rearrange(logits, "b ... c -> b (...) c")
                 logits = logits[:, :seq_len]
 
-            inspect_shapes("MEGABYTE output logits", logits=logits)
+            if use_cache:
+                return logits, cache
             return logits
 
         logits = rearrange(logits, "b ... c -> b (...) c")
