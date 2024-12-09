@@ -5,6 +5,7 @@ from packaging import version
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel
 
 from einops import rearrange
 
@@ -48,9 +49,11 @@ class Attend(nn.Module):
         assert not (flash and version.parse(torch.__version__) < version.parse('2.0.0')), 'in order to use flash attention, you must be using pytorch 2.0 or above'
 
         # determine efficient attention configs for cuda and cpu
-
-        self.cpu_config = EfficientAttentionConfig(True, True, True)
-        self.cuda_config = None
+        
+        from torch.nn.attention import SDPBackend as BE
+        self.cpu_config = [BE.FLASH_ATTENTION, BE.MATH, BE.EFFICIENT_ATTENTION]
+        # self.cpu_config = EfficientAttentionConfig(True, True, True)
+        # self.cuda_config = None
 
         if not torch.cuda.is_available() or not flash:
             return
@@ -59,10 +62,12 @@ class Attend(nn.Module):
 
         if device_properties.major > 8 and device_properties.minor == 0:
             print_once('A100 GPU detected, using flash attention if input tensor is on cuda')
-            self.cuda_config = EfficientAttentionConfig(True, False, False)
+            # self.cuda_config = EfficientAttentionConfig(True, False, False)
+            self.cuda_config = [BE.FLASH_ATTENTION, BE.CUDNN_ATTENTION]
         else:
             print_once('Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda')
-            self.cuda_config = EfficientAttentionConfig(False, True, True)
+            # self.cuda_config = EfficientAttentionConfig(False, True, True)
+            self.cuda_config = [BE.MATH, BE.EFFICIENT_ATTENTION, BE.CUDNN_ATTENTION]
 
     def get_mask(self, i, j, device):
         return torch.ones((i, j), device=device, dtype=torch.bool).triu(j - i + 1)
@@ -91,7 +96,7 @@ class Attend(nn.Module):
 
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
 
-        with torch.backends.cuda.sdp_kernel(**config._asdict()):
+        with sdpa_kernel(config):
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask = mask,
