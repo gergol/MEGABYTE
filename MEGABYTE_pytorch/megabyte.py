@@ -12,8 +12,10 @@ from einops.layers.torch import Rearrange
 
 from beartype import beartype
 from beartype.typing import Tuple, Union, List, Optional, Dict
+from collections.abc import Callable
 
 from MEGABYTE_pytorch.attend import Attend
+
 
 from tqdm import tqdm
 import pprint
@@ -301,6 +303,7 @@ class MEGABYTE(nn.Module):
         flash_attn: bool = False,
         add_cross_attention: bool = False,
         use_old_layout: bool = False,  # this is temporarily necessary because in previous versions the ordering of the cross attention and ff layers in the transformer was different. This is only an issue when trying to load an old checkpoint preceeding this change
+        criterion: Callable[[torch.Tensor, torch.Tensor, ...], float] = F.cross_entropy,
     ):
         super().__init__()
 
@@ -384,6 +387,7 @@ class MEGABYTE(nn.Module):
 
         self.to_logits = nn.Linear(fine_dim, vocab_size)
         self.pad_token_id = pad_token_id
+        self.criterion = criterion
 
     def generate(self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1):
         total_seq_len = reduce_mult(self.max_sequence_lengths)
@@ -604,7 +608,7 @@ class MEGABYTE(nn.Module):
         preds = rearrange(logits, "b n c -> b c n")
         labels = rearrange(ids, "b ... -> b (...)")
 
-        loss = F.cross_entropy(preds[..., :-1], labels, ignore_index=self.pad_token_id)
+        loss = self.criterion(preds[..., :-1], labels, ignore_index=self.pad_token_id)
 
         if return_preds_and_labels:
             return loss, preds, labels
