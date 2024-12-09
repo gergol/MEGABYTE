@@ -11,15 +11,20 @@ from einops import rearrange
 
 # constants
 
-EfficientAttentionConfig = namedtuple('EfficientAttentionConfig', ['enable_flash', 'enable_math', 'enable_mem_efficient'])
+EfficientAttentionConfig = namedtuple(
+    "EfficientAttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"]
+)
 
 # helpers
+
 
 def exists(val):
     return val is not None
 
+
 def once(fn):
     called = False
+
     @wraps(fn)
     def inner(x):
         nonlocal called
@@ -27,30 +32,31 @@ def once(fn):
             return
         called = True
         return fn(x)
+
     return inner
+
 
 print_once = once(print)
 
 # main class
 
+
 class Attend(nn.Module):
-    def __init__(
-        self,
-        causal = False,
-        dropout = 0.,
-        flash = False
-    ):
+    def __init__(self, causal=False, dropout=0.0, flash=False):
         super().__init__()
         self.dropout = dropout
         self.attn_dropout = nn.Dropout(dropout)
 
         self.causal = causal
         self.flash = flash
-        assert not (flash and version.parse(torch.__version__) < version.parse('2.0.0')), 'in order to use flash attention, you must be using pytorch 2.0 or above'
+        assert not (
+            flash and version.parse(torch.__version__) < version.parse("2.0.0")
+        ), "in order to use flash attention, you must be using pytorch 2.0 or above"
 
         # determine efficient attention configs for cuda and cpu
-        
+
         from torch.nn.attention import SDPBackend as BE
+
         self.cpu_config = [BE.FLASH_ATTENTION, BE.MATH, BE.EFFICIENT_ATTENTION]
         # self.cpu_config = EfficientAttentionConfig(True, True, True)
         # self.cuda_config = None
@@ -58,37 +64,37 @@ class Attend(nn.Module):
         if not torch.cuda.is_available() or not flash:
             return
 
-        device_properties = torch.cuda.get_device_properties(torch.device('cuda'))
+        device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
 
         if device_properties.major > 8 and device_properties.minor == 0:
-            print_once('A100 GPU detected, using flash attention if input tensor is on cuda')
+            print_once("A100 GPU detected, using flash attention if input tensor is on cuda")
             # self.cuda_config = EfficientAttentionConfig(True, False, False)
             self.cuda_config = [BE.FLASH_ATTENTION, BE.CUDNN_ATTENTION]
         else:
-            print_once('Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda')
+            print_once("Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda")
             # self.cuda_config = EfficientAttentionConfig(False, True, True)
             self.cuda_config = [BE.MATH, BE.EFFICIENT_ATTENTION, BE.CUDNN_ATTENTION]
 
     def get_mask(self, i, j, device):
         return torch.ones((i, j), device=device, dtype=torch.bool).triu(j - i + 1)
 
-    def flash_attn(self, q, k, v, mask = None, attn_bias = None):
+    def flash_attn(self, q, k, v, mask=None, attn_bias=None):
         _, heads, q_len, _, k_len, is_cuda, device = *q.shape, k.shape[-2], q.is_cuda, q.device
 
         # single headed key / values
 
         if k.ndim == 3:
-            k = rearrange(k, 'b n d -> b 1 n d')
+            k = rearrange(k, "b n d -> b 1 n d")
 
         if v.ndim == 3:
-            v = rearrange(v, 'b n d -> b 1 n d')
+            v = rearrange(v, "b n d -> b 1 n d")
 
         # Check if mask exists and expand to compatible shape
         # The mask is B L, so it would have to be expanded to B H N L
 
-        if exists(mask) and mask.ndim != 4:
-            mask = rearrange(mask, 'b j -> b 1 1 j')
-            mask = mask.expand(-1, heads, q_len, -1)
+        if exists(mask) and mask.ndim != 4:  # type: ignore
+            mask = rearrange(mask, "b j -> b 1 1 j")
+            mask = mask.expand(-1, heads, q_len, -1)  # type: ignore
 
         # Check if there is a compatible device for flash attention
 
@@ -98,15 +104,12 @@ class Attend(nn.Module):
 
         with sdpa_kernel(config):
             out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask = mask,
-                dropout_p = self.dropout if self.training else 0., 
-                is_causal = self.causal
+                q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0, is_causal=self.causal
             )
 
         return out
 
-    def forward(self, q, k, v, mask = None):
+    def forward(self, q, k, v, mask=None):
         """
         einstein notation
         b - batch
@@ -119,10 +122,10 @@ class Attend(nn.Module):
 
         scale = q.shape[-1] ** -0.5
 
-        kv_einsum_eq = 'b j d' if k.ndim == 3 else 'b h j d'
+        kv_einsum_eq = "b j d" if k.ndim == 3 else "b h j d"
 
         if self.flash:
-            return self.flash_attn(q, k, v, mask = mask)
+            return self.flash_attn(q, k, v, mask=mask)
 
         # similarity
 
