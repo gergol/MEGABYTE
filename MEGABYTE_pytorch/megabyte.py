@@ -175,10 +175,11 @@ class Attention(nn.Module):
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-    def forward(self, x, rotary_emb=None, encoder_hidden_states=None, cache=None):
+    def forward(self, x, rotary_emb=None, encoder_hidden_states=None, use_cache=False, cache=None):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
         h = self.heads
         x = self.norm(x)
+        # inspect_shapes("Attend input", x=x)
         if self.is_cross_attention:
             q, k, v = (self.to_q(x), *self.to_kv(encoder_hidden_states).chunk(2, dim=-1))
         else:
@@ -188,11 +189,25 @@ class Attention(nn.Module):
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
 
-        # inspect_shapes("before attend: ", q=q, k=k, v=v)
+        if use_cache:
+            if cache is not None:
+                k_cache = cache.get("k")
+                v_cache = cache.get("v")
+                if k_cache is not None and v_cache is not None:
+                    k = torch.cat((k_cache, k), dim=2)
+                    v = torch.cat((v_cache, v), dim=2)
+                cache["k"] = k
+                cache["v"] = v
+            else:
+                cache = {"k": k, "v": v}
+
+        # inspect_shapes("pre_attend", q=q, k=k, v=v)
+        # print("v", v)
+
         out = self.attend(q, k, v)
 
         out = rearrange(out, "b h n d -> b n (h d)")
-        return self.to_out(out)
+        return self.to_out(out), cache
 
 
 class Transformer(nn.Module):
@@ -252,30 +267,43 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(dim)
         self.has_cross_attention = has_cross_attention
 
-    def forward(self, x, encoder_hidden_states=None):
-        inspect_shapes("Transformer", x=x)
+    def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None):
+        # inspect_shapes("Transformer", x=x)
         n = x.shape[-2]
-        rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None
+        rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None  # type: ignore
 
+        if use_cache and cache is None:
+            cache = [None] * len(self.layers)
         if self.has_cross_attention:
-            for attn, ff, cross_attn in self.layers:
+
+            for layer_idx, (attn, ff, cross_attn) in enumerate(self.layers):  # type: ignore
                 if self.use_old_layout:
                     cross_attn, ff = ff, cross_attn  # swap the variable names to match the old layout if needed
-                # for attn, cross_attn, ff in self.layers:
-                x = attn(token_shift(x), rotary_emb=rotary_emb) + x
-                # inspect_shapes("Transformer post attn", x=x)
-                x = cross_attn(token_shift(x), rotary_emb=rotary_emb, encoder_hidden_states=encoder_hidden_states) + x
-                # inspect_shapes("Transformer post cross attn", x=x)
-                x = ff(token_shift(x)) + x
-                # inspect_shapes("Transformer post ff", x=x)
-        else:
-            for attn, ff in self.layers:
-                x = attn(token_shift(x), rotary_emb=rotary_emb) + x
-                # inspect_shapes("Transformer post attn", x=x)
-                x = ff(token_shift(x)) + x
-                # inspect_shapes("Transformer post ff", x=x)
 
-        return self.norm(x)
+                layer_cache = cache[layer_idx] if cache is not None else None
+                attended, layer_cache = attn(
+                    token_shift(x), rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
+                )
+                x = attended + x
+                x = (
+                    cross_attn(token_shift(x), rotary_emb=rotary_emb, encoder_hidden_states=encoder_hidden_states)[0]
+                    + x
+                )
+                x = ff(token_shift(x)) + x
+                if cache is not None:
+                    cache[layer_idx] = layer_cache
+        else:
+            for layer_idx, (attn, ff) in enumerate(self.layers):  # type: ignore
+                layer_cache = cache[layer_idx] if cache is not None else None
+                attended, layer_cache = attn(
+                    token_shift(x), rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
+                )
+                x = attended + x
+                x = ff(token_shift(x)) + x
+                if cache is not None:
+                    cache[layer_idx] = layer_cache
+
+        return self.norm(x), cache
 
 
 # main class
@@ -444,7 +472,7 @@ class MEGABYTE(nn.Module):
             return self.to_logits(tokens), cache  # type: ignore
         return self.to_logits(tokens)  # type: ignore
 
-    def forward(
+    def forward_old(
         self,
         ids,
         return_loss=False,
@@ -452,11 +480,13 @@ class MEGABYTE(nn.Module):
         return_preds_and_labels=False,
         use_cache=False,
         cache: Optional[Dict] = None,
+        profile: bool = False,
     ):
         batch = ids.shape[0]
         N = ids.shape[1]
 
-        inspect_shapes("MEGABYTE", ids=ids)
+        # print("\n\nCALLING MEGABYTE FORWARD", ids.shape)
+        # inspect_shapes("MEGABYTE", ids=ids)
         assert ids.ndim in {2, self.stages + 1}
         assert self.add_cross_attention == (
             encoder_hidden_states is not None
@@ -471,11 +501,185 @@ class MEGABYTE(nn.Module):
 
         if use_cache and cache is None:
             cache = {}
-            cache["kv"] = [[]] * len(self.transformers)
+            cache["kv"] = [None] * len(self.transformers)
             cache["hidden_states"] = [None] * (self.depth - 1)
+            if profile:
+                cache["profile"] = [[] for _ in range(self.depth)]
 
         do_profile = cache is not None and "profile" in cache
+        if ids.numel() == 0:
+            return self.forward_empty(
+                ids.shape[0], encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
+            )
 
+        if flattened_dims:
+            # allow for ids to be given in the shape of (batch, seq)
+            # in which case it will be auto-padded to the next nearest multiple of depth seq len
+            seq_len = ids.shape[-1]
+            multiple_of = reduce_mult(self.max_sequence_lengths[1:])
+            padding = remainder_to_mult(seq_len, multiple_of)
+            ids = F.pad(ids, (0, padding), value=self.pad_token_id)
+            ids = ids.reshape(batch, -1, *self.max_sequence_lengths[1:])
+
+        b, *prec_dims, device = *ids.shape, ids.device
+
+        # check some dimensions
+
+        assert (
+            prec_dims[0] <= self.max_sequence_lengths[0]
+        ), "the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_sequence_lengths (like any autoregressive transformer)"
+        assert tuple(prec_dims[1:]) == tuple(
+            self.max_sequence_lengths[1:]
+        ), "all subsequent dimensions must match exactly"
+
+        # get tokens for all hierarchical stages, reducing by appropriate dimensions
+        # and adding the absolute positional embeddings
+
+        tokens_at_stages = []
+        pos_embs = default(self.pos_embs, (None,))
+
+        for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
+            is_first = stage_idx == 0
+
+            tokens = token_emb(ids)
+
+            if exists(pos_emb):
+                positions = pos_emb(torch.arange(tokens.shape[-2], device=device))
+                tokens = tokens + positions
+
+            tokens_at_stages.insert(0, tokens)
+
+            if is_first:
+                continue
+
+            ids = rearrange(ids, "... m n -> ... (m n)")
+
+        # the un-pixelshuffled representations of the previous hierarchy, starts with None
+
+        prev_stage_tokens_repr = None
+
+        # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
+        first_stage = True
+        for stage_idx, stage_start_tokens, stage_tokens, transformer, proj in zip(
+            range(self.depth),
+            self.start_tokens,
+            tokens_at_stages,
+            self.transformers,
+            self.to_next_transformer_projections,
+        ):
+            if do_profile:
+                start_time = time.time()
+            if use_cache and stage_idx < len(cache["hidden_states"]):
+                hs = cache["hidden_states"][stage_idx]
+                # for networks with higer depth, we need to change this by the product of the subsequent layers
+                scale_factor = self.max_sequence_lengths[1]
+                if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
+                    # we have cached values for the current step, so we can skip that forward pass
+                    prev_stage_tokens_repr = hs
+                    if do_profile:
+                        cache["profile"][stage_idx].append(time.time() - start_time)
+                    continue
+                # if hs is not None:
+
+            stage_tokens, ps = pack_one(stage_tokens, "* n d")
+            stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
+
+            # concat start token
+            stage_tokens = torch.cat(
+                (
+                    stage_start_tokens,
+                    stage_tokens,
+                ),
+                dim=-2,
+            )
+
+            # sum the previous hierarchy's representation
+            if exists(prev_stage_tokens_repr):
+                prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
+                stage_tokens = stage_tokens + prev_stage_tokens_repr
+
+            if first_stage and self.add_cross_attention:
+                attended = transformer(stage_tokens, encoder_hidden_states=encoder_hidden_states)
+            else:
+                attended = transformer(stage_tokens)
+
+            attended = unpack_one(attended, ps, "* n d")
+
+            # project for next stage in the hierarchy
+
+            prev_stage_tokens_repr = proj(attended[..., :-1, :])
+            if use_cache and stage_idx < self.depth - 1:
+                cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
+            first_stage = False
+            if do_profile:
+                cache["profile"][stage_idx].append(time.time() - start_time)
+
+        # project to logits
+
+        logits = self.to_logits(attended)
+
+        start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
+        start_tokens = rearrange(start_tokens, "b d -> b 1 d")
+
+        logits = logits[..., 1:, :]
+
+        if not return_loss:
+
+            if flattened_dims:
+                logits = rearrange(logits, "b ... c -> b (...) c")
+                logits = logits[:, :seq_len]
+
+            if use_cache:
+                return logits, cache
+            return logits
+
+        logits = rearrange(logits, "b ... c -> b (...) c")
+        logits = torch.cat((start_tokens, logits), dim=-2)
+
+        preds = rearrange(logits, "b n c -> b c n")
+        labels = rearrange(ids, "b ... -> b (...)")
+
+        loss = self.criterion(preds[..., :-1], labels, ignore_index=self.pad_token_id)
+
+        if return_preds_and_labels:
+            return loss, preds, labels
+        return loss
+
+    def forward(
+        self,
+        ids,
+        return_loss=False,
+        encoder_hidden_states=None,
+        return_preds_and_labels=False,
+        use_cache=False,
+        cache: Optional[Dict] = None,
+        profile: bool = False,
+    ):
+        batch = ids.shape[0]
+        N = ids.shape[1]
+
+        # print("\n\nCALLING MEGABYTE FORWARD", ids.shape)
+        # inspect_shapes("MEGABYTE", ids=ids)
+        assert ids.ndim in {2, self.stages + 1}
+        assert self.add_cross_attention == (
+            encoder_hidden_states is not None
+        ), "encoder_hidden_states are expected if and only if self.add_cross_attention == True"
+
+        assert not use_cache or self.depth == 2, "cache is only implemented for two-layer MEGABYTE models"
+        assert (
+            not use_cache or len(ids.shape) == 2 and batch == 1
+        ), "caching is curently only supported for batch size == 1"
+
+        flattened_dims = ids.ndim == 2
+
+        if use_cache and cache is None:
+            cache = {}
+            cache["kv"] = [None] * len(self.transformers)
+            cache["hidden_states"] = [None] * (self.depth - 1)
+            if profile:
+                cache["profile"] = [[] for _ in range(self.depth)]
+
+        do_profile = cache is not None and "profile" in cache
         if ids.numel() == 0:
             return self.forward_empty(
                 ids.shape[0], encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
