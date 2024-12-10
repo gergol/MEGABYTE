@@ -24,7 +24,7 @@ import pprint
 
 
 def inspect_shapes(prefix, **tensors):
-    if True:
+    if False:
         return
     shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items()]
     import numpy as np
@@ -100,7 +100,9 @@ def top_k(logits, thres=0.5):
 # token shift, from Peng et al of RWKV
 
 
-def token_shift(t):
+def token_shift(t, bypass=False):
+    if bypass:
+        return t
     t, t_shift = t.chunk(2, dim=-1)
     t_shift = F.pad(t_shift, (0, 0, 1, -1))
     return torch.cat((t, t_shift), dim=-1)
@@ -179,30 +181,32 @@ class Attention(nn.Module):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
         h = self.heads
         x = self.norm(x)
-        # inspect_shapes("Attend input", x=x)
+        inspect_shapes("Attend input", x=x)
+        print("ATTEND INPUT \n", x, "\nEND")
         if self.is_cross_attention:
             q, k, v = (self.to_q(x), *self.to_kv(encoder_hidden_states).chunk(2, dim=-1))
         else:
             q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim=-1))
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
-        if exists(rotary_emb):
-            q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
-
         if use_cache:
             if cache is not None:
+                print("READING FROM CHACHE")
                 k_cache = cache.get("k")
                 v_cache = cache.get("v")
                 if k_cache is not None and v_cache is not None:
                     k = torch.cat((k_cache, k), dim=2)
                     v = torch.cat((v_cache, v), dim=2)
-                cache["k"] = k
-                cache["v"] = v
+                cache["k"] = k.clone()
+                cache["v"] = v.clone()
             else:
-                cache = {"k": k, "v": v}
+                cache = {"k": k.clone(), "v": v.clone()}
 
-        # inspect_shapes("pre_attend", q=q, k=k, v=v)
-        # print("v", v)
+        if exists(rotary_emb):
+            q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
+
+        inspect_shapes("pre_attend", q=q, k=k, v=v)
+        print("v", v)
 
         out = self.attend(q, k, v)
 
@@ -271,6 +275,10 @@ class Transformer(nn.Module):
         # inspect_shapes("Transformer", x=x)
         n = x.shape[-2]
         rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None  # type: ignore
+        # Adding this switch was necessary to be able to use kv caching
+        # and true token by token inferencen without altering the results
+        # TODO: Check how this affects the actual inference results
+        is_inference = not self.training
 
         if use_cache and cache is None:
             cache = [None] * len(self.layers)
@@ -282,24 +290,32 @@ class Transformer(nn.Module):
 
                 layer_cache = cache[layer_idx] if cache is not None else None
                 attended, layer_cache = attn(
-                    token_shift(x), rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
+                    token_shift(x, bypass=is_inference), rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
                 )
                 x = attended + x
                 x = (
-                    cross_attn(token_shift(x), rotary_emb=rotary_emb, encoder_hidden_states=encoder_hidden_states)[0]
+                    cross_attn(
+                        token_shift(x, bypass=is_inference),
+                        rotary_emb=rotary_emb,
+                        encoder_hidden_states=encoder_hidden_states,
+                    )[0]
                     + x
                 )
-                x = ff(token_shift(x)) + x
+                x = ff(token_shift(x, bypass=is_inference)) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
         else:
             for layer_idx, (attn, ff) in enumerate(self.layers):  # type: ignore
                 layer_cache = cache[layer_idx] if cache is not None else None
                 attended, layer_cache = attn(
-                    token_shift(x), rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
+                    token_shift(x, bypass=is_inference),
+                    rotary_emb=rotary_emb,
+                    use_cache=use_cache,
+                    cache=layer_cache,
+                    # x, rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
                 )
                 x = attended + x
-                x = ff(token_shift(x)) + x
+                x = ff(token_shift(x, bypass=is_inference)) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
 
@@ -469,6 +485,7 @@ class MEGABYTE(nn.Module):
                 tokens, stage_cache = transformer(tokens, use_cache=use_cache, cache=stage_cache)
             prev_stage_tokens_repr = proj(tokens)
             if use_cache:
+                inspect_shapes(f"out (forward_empty) KV of stage {stage_idx}", k=stage_cache[0]["k"])
                 cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr
@@ -584,6 +601,8 @@ class MEGABYTE(nn.Module):
                     if do_profile:
                         cache["profile"][stage_idx].append(time.time() - start_time)
                     continue
+                else:
+                    print("NOT USING HS CACHE")
                 # if hs is not None:
 
             stage_tokens, ps = pack_one(stage_tokens, "* n d")
@@ -678,6 +697,8 @@ class MEGABYTE(nn.Module):
         use_cache=False,
         cache: Optional[Dict] = None,
         profile: bool = False,
+        padded: bool = True,
+        tok_idx_in_seq=None,
     ):
         batch = ids.shape[0]
         N = ids.shape[1]
@@ -769,13 +790,15 @@ class MEGABYTE(nn.Module):
             if use_cache and stage_idx < len(cache["hidden_states"]):
                 hs = cache["hidden_states"][stage_idx]
                 # for networks with higer depth, we need to change this by the product of the subsequent layers
-                scale_factor = self.max_sequence_lengths[1]
-                if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
+                scale_factor = self.max_sequence_lengths[stage_idx + 1]
+                # if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
+                if hs is not None and (tok_idx_in_seq + 1) % scale_factor == 0:
                     # we have cached values for the current step, so we can skip that forward pass
                     prev_stage_tokens_repr = hs
                     if do_profile:
                         cache["profile"][stage_idx].append(time.time() - start_time)
                     continue
+                print("NOT USING HS CACHE")
                 # if hs is not None:
 
             stage_tokens, ps = pack_one(stage_tokens, "* n d")
@@ -823,9 +846,11 @@ class MEGABYTE(nn.Module):
 
             # inspect_shapes(f"attention PROJECTED output stage {stage_idx}", proj=prev_stage_tokens_repr)
             if use_cache:
+                inspect_shapes(f"out KV of stage {stage_idx}", k=stage_cache[0]["k"])
                 cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
+                inspect_shapes(f"out HS of stage {stage_idx}", hs=cache["hidden_states"][stage_idx])
             first_stage = False
             if do_profile:
                 cache["profile"][stage_idx].append(time.time() - start_time)
@@ -901,11 +926,13 @@ if __name__ == "__main__":
             # cache = {'profile': [[], []], 'hidden_states': [None, None], 'kv': [[],[]]}
             cache = None
             x = prime
-            use_cache = False
+            use_old_algo = True
             for tok_idx in range(32):
                 print("GENERATING ", tok_idx, time.time())
-                if use_cache:
-                    logits, cache = model.forward(ids=x, use_cache=True, cache=cache, profile=False)
+                if not use_old_algo:
+                    logits, cache = model.forward(
+                        ids=x, use_cache=True, cache=cache, profile=False, padded=False, tok_idx_in_seq=tok_idx
+                    )
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                     logits = logits[:, -1]
                     logits = top_k(logits, thres=filter_thres)
@@ -913,9 +940,10 @@ if __name__ == "__main__":
                     seq_len += 1
                     x = rearrange(sampled, "b -> b 1")
                     seq = torch.cat((seq, x), dim=-1)
-                    x = seq
+                    # x = seq
                 else:
-                    logits = model.forward(ids=x, use_cache=False, cache=cache, profile=False)
+                    logits = model.forward_old(ids=x, use_cache=False, cache=cache, profile=False)
+                    # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                     logits = logits[:, -1]
                     logits = top_k(logits, thres=filter_thres)
