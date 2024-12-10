@@ -459,12 +459,17 @@ class MEGABYTE(nn.Module):
             if prev_stage_tokens_repr is not None:
                 tokens = tokens + prev_stage_tokens_repr[..., : tokens.shape[-2], :]
 
+            stage_cache = cache["kv"][stage_idx] if cache else None
             if is_first_stage:
-                tokens = transformer(tokens, encoder_hidden_states=encoder_hidden_states)
+                tokens, stage_cache = transformer(
+                    tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
+                )
                 is_first_stage = False
             else:
-                tokens = transformer(tokens)
+                tokens, stage_cache = transformer(tokens, use_cache=use_cache, cache=stage_cache)
             prev_stage_tokens_repr = proj(tokens)
+            if use_cache:
+                cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr
 
@@ -598,16 +603,35 @@ class MEGABYTE(nn.Module):
                 prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
                 stage_tokens = stage_tokens + prev_stage_tokens_repr
 
+            stage_cache = cache["kv"][stage_idx] if cache else None
+            # inspect_shapes(f"stage tokens to transormer {stage_idx}", stage_tokens=stage_tokens)
+            # if DO_HACK:
+            #     # TODO this only works for batch size 1 and only during inference without prompt
+            #     stage_tokens = stage_tokens[-1].unsqueeze(0)
             if first_stage and self.add_cross_attention:
-                attended = transformer(stage_tokens, encoder_hidden_states=encoder_hidden_states)
+                attended, stage_cache = transformer(
+                    stage_tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
+                )
             else:
-                attended = transformer(stage_tokens)
-
+                attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache)
+            # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
+            # print("before unpacking: ps: ", ps)
             attended = unpack_one(attended, ps, "* n d")
+            # inspect_shapes(f"attention UNPACKED output stage {stage_idx}", attended_unpacked=attended)
 
             # project for next stage in the hierarchy
 
             prev_stage_tokens_repr = proj(attended[..., :-1, :])
+
+            # if not self.training:
+            #     print("BAMMM")
+            #     # TODO: this is for testing only as it will break handling longer input prompts
+            #     # it will onlhy work for token by token inference
+            #     prev_stage_tokens_repr = prev_stage_tokens_repr[-1]
+
+            # inspect_shapes(f"attention PROJECTED output stage {stage_idx}", proj=prev_stage_tokens_repr)
+            if use_cache:
+                cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
             first_stage = False
@@ -771,16 +795,35 @@ class MEGABYTE(nn.Module):
                 prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
                 stage_tokens = stage_tokens + prev_stage_tokens_repr
 
+            stage_cache = cache["kv"][stage_idx] if cache else None
+            # inspect_shapes(f"stage tokens to transormer {stage_idx}", stage_tokens=stage_tokens)
+            # if DO_HACK:
+            #     # TODO this only works for batch size 1 and only during inference without prompt
+            #     stage_tokens = stage_tokens[-1].unsqueeze(0)
             if first_stage and self.add_cross_attention:
-                attended = transformer(stage_tokens, encoder_hidden_states=encoder_hidden_states)
+                attended, stage_cache = transformer(
+                    stage_tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
+                )
             else:
-                attended = transformer(stage_tokens)
-
+                attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache)
+            # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
+            # print("before unpacking: ps: ", ps)
             attended = unpack_one(attended, ps, "* n d")
+            # inspect_shapes(f"attention UNPACKED output stage {stage_idx}", attended_unpacked=attended)
 
             # project for next stage in the hierarchy
 
             prev_stage_tokens_repr = proj(attended[..., :-1, :])
+
+            # if not self.training:
+            #     print("BAMMM")
+            #     # TODO: this is for testing only as it will break handling longer input prompts
+            #     # it will onlhy work for token by token inference
+            #     prev_stage_tokens_repr = prev_stage_tokens_repr[-1]
+
+            # inspect_shapes(f"attention PROJECTED output stage {stage_idx}", proj=prev_stage_tokens_repr)
+            if use_cache:
+                cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
             first_stage = False
@@ -817,3 +860,85 @@ class MEGABYTE(nn.Module):
         if return_preds_and_labels:
             return loss, preds, labels
         return loss
+
+
+if __name__ == "__main__":
+
+    print("\n*************************************************************************************")
+    print("STARTING SCRIPT", time.time())
+    print("*************************************************************************************\n")
+
+    import lightning as L
+
+    L.seed_everything(43894)
+
+    def generate_few(
+        model,
+        prime=None,
+        filter_thres=0.9,
+        temperature=1.0,
+        default_batch_size=1,
+    ):
+
+        model.eval()
+
+        start_time = time.time()
+
+        with torch.inference_mode():
+
+            # total_seq_len = reduce_mult(model.max_sequence_lengths)
+            device = "cuda"
+            # print(device)
+
+            if not exists(prime):
+                prime = torch.empty((default_batch_size, 0), dtype=torch.long, device=device)
+            prime = prime.to(device)
+
+            seq = prime
+            batch = seq.shape[0]
+
+            seq_len = seq.shape[-1]
+            # cache = {'profile': [[], []], 'hidden_states': [None, None], 'kv': [[],[]]}
+            cache = None
+            x = prime
+            use_cache = False
+            for tok_idx in range(32):
+                print("GENERATING ", tok_idx, time.time())
+                if use_cache:
+                    logits, cache = model.forward(ids=x, use_cache=True, cache=cache, profile=False)
+                    # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+                    logits = logits[:, -1]
+                    logits = top_k(logits, thres=filter_thres)
+                    sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+                    seq_len += 1
+                    x = rearrange(sampled, "b -> b 1")
+                    seq = torch.cat((seq, x), dim=-1)
+                    x = seq
+                else:
+                    logits = model.forward(ids=x, use_cache=False, cache=cache, profile=False)
+                    # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+                    logits = logits[:, -1]
+                    logits = top_k(logits, thres=filter_thres)
+                    sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+                    seq_len += 1
+                    x = rearrange(sampled, "b -> b 1")
+                    seq = torch.cat((seq, x), dim=-1)
+                    x = seq
+            dur = time.time() - start_time
+            print(f"Generated {seq_len} tokens in {dur:.2f} seconds ({seq_len/dur:.1f} tokens/s)")
+            return seq.reshape(batch, seq_len).flatten(-1), cache
+
+    prime = None  # torch.zeros((1, 3), dtype = torch.long, device = 'cuda')
+    model = MEGABYTE(
+        vocab_size=5,
+        hidden_sizes=(3, 2),
+        num_hidden_layers=(1, 1),
+        max_sequence_lengths=(8, 4),
+        dim_head=2,
+        num_heads=2,
+    )
+
+    model = model.cuda()
+    model.eval()
+    Y, cache = generate_few(model, prime=prime, temperature=0.5, default_batch_size=1)
+    print(Y)
