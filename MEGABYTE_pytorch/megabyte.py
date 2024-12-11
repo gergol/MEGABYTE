@@ -26,13 +26,13 @@ import pprint
 def inspect_shapes(prefix, **tensors):
     if False:
         return
-    shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items()]
+    shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items() if v is not None]
     import numpy as np
 
     np.set_printoptions(precision=2)
     print(f"{prefix}: {shapes}")
     # vals = [f"{k}={tuple(x for x in v.cpu().numpy())}" for k, v in tensors.items()]
-    vals = {k: str(hash(str(v.cpu().numpy())))[-5:] for k, v in tensors.items()}
+    vals = {k: str(hash(str(v.cpu().numpy())))[-5:] for k, v in tensors.items() if v is not None}
     # vals = []
     # import numpy as np
     # for k, v in tensors.items():
@@ -101,11 +101,14 @@ def top_k(logits, thres=0.5):
 
 
 def token_shift(t, bypass=False):
+    # inspect_shapes("TOKENSHIFR INPUT", t=t)
     if bypass:
         return t
     t, t_shift = t.chunk(2, dim=-1)
     t_shift = F.pad(t_shift, (0, 0, 1, -1))
-    return torch.cat((t, t_shift), dim=-1)
+    result = torch.cat((t, t_shift), dim=-1)
+    # print(result)
+    return result
 
 
 # rotary positional embedding
@@ -181,8 +184,8 @@ class Attention(nn.Module):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
         h = self.heads
         x = self.norm(x)
-        inspect_shapes("Attend input", x=x)
-        print("ATTEND INPUT \n", x, "\nEND")
+        # inspect_shapes("Attend input", x=x)
+        # print("ATTEND INPUT \n", x, "\nEND")
         if self.is_cross_attention:
             q, k, v = (self.to_q(x), *self.to_kv(encoder_hidden_states).chunk(2, dim=-1))
         else:
@@ -191,7 +194,7 @@ class Attention(nn.Module):
 
         if use_cache:
             if cache is not None:
-                print("READING FROM CHACHE")
+                # print("READING FROM CHACHE")
                 k_cache = cache.get("k")
                 v_cache = cache.get("v")
                 if k_cache is not None and v_cache is not None:
@@ -201,12 +204,12 @@ class Attention(nn.Module):
                 cache["v"] = v.clone()
             else:
                 cache = {"k": k.clone(), "v": v.clone()}
-
+            print("kv cache: ", cache["v"].shape)
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
 
-        inspect_shapes("pre_attend", q=q, k=k, v=v)
-        print("v", v)
+        # inspect_shapes("pre_attend", q=q, k=k, v=v)
+        # print("v", v)
 
         out = self.attend(q, k, v)
 
@@ -271,14 +274,10 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(dim)
         self.has_cross_attention = has_cross_attention
 
-    def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None):
-        # inspect_shapes("Transformer", x=x)
+    def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None, bypass_token_shift=False):
+        inspect_shapes("Transformer", x=x)
         n = x.shape[-2]
         rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None  # type: ignore
-        # Adding this switch was necessary to be able to use kv caching
-        # and true token by token inferencen without altering the results
-        # TODO: Check how this affects the actual inference results
-        is_inference = not self.training
 
         if use_cache and cache is None:
             cache = [None] * len(self.layers)
@@ -290,32 +289,35 @@ class Transformer(nn.Module):
 
                 layer_cache = cache[layer_idx] if cache is not None else None
                 attended, layer_cache = attn(
-                    token_shift(x, bypass=is_inference), rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
+                    token_shift(x, bypass=bypass_token_shift),
+                    rotary_emb=rotary_emb,
+                    use_cache=use_cache,
+                    cache=layer_cache,
                 )
                 x = attended + x
                 x = (
                     cross_attn(
-                        token_shift(x, bypass=is_inference),
+                        token_shift(x, bypass=bypass_token_shift),
                         rotary_emb=rotary_emb,
                         encoder_hidden_states=encoder_hidden_states,
                     )[0]
                     + x
                 )
-                x = ff(token_shift(x, bypass=is_inference)) + x
+                x = ff(token_shift(x, bypass=bypass_token_shift)) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
         else:
             for layer_idx, (attn, ff) in enumerate(self.layers):  # type: ignore
                 layer_cache = cache[layer_idx] if cache is not None else None
                 attended, layer_cache = attn(
-                    token_shift(x, bypass=is_inference),
+                    token_shift(x, bypass=bypass_token_shift),
                     rotary_emb=rotary_emb,
                     use_cache=use_cache,
                     cache=layer_cache,
                     # x, rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
                 )
                 x = attended + x
-                x = ff(token_shift(x, bypass=is_inference)) + x
+                x = ff(token_shift(x, bypass=bypass_token_shift)) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
 
@@ -494,7 +496,7 @@ class MEGABYTE(nn.Module):
             return self.to_logits(tokens), cache  # type: ignore
         return self.to_logits(tokens)  # type: ignore
 
-    def forward_old(
+    def forward(
         self,
         ids,
         return_loss=False,
@@ -504,6 +506,7 @@ class MEGABYTE(nn.Module):
         cache: Optional[Dict] = None,
         profile: bool = False,
     ):
+        print("input ids: ", ids)
         batch = ids.shape[0]
         N = ids.shape[1]
 
@@ -562,6 +565,7 @@ class MEGABYTE(nn.Module):
 
         for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
             is_first = stage_idx == 0
+            inspect_shapes(f"stage {stage_idx} pre token emb", tokens=ids)
 
             tokens = token_emb(ids)
 
@@ -589,6 +593,8 @@ class MEGABYTE(nn.Module):
             self.transformers,
             self.to_next_transformer_projections,
         ):
+            inspect_shapes(f"STAGE {stage_idx}", stage_tokens=stage_tokens, start_tokens=stage_start_tokens)
+            # print(stage_tokens)
             if do_profile:
                 start_time = time.time()
             if use_cache and stage_idx < len(cache["hidden_states"]):
@@ -607,6 +613,12 @@ class MEGABYTE(nn.Module):
 
             stage_tokens, ps = pack_one(stage_tokens, "* n d")
             stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
+            inspect_shapes(
+                "after pack",
+                stage_tokens=stage_tokens,
+                start_tokens=stage_start_tokens,
+                prev_stage_tokens_repr=prev_stage_tokens_repr,
+            )
 
             # concat start token
             stage_tokens = torch.cat(
@@ -672,6 +684,7 @@ class MEGABYTE(nn.Module):
                 logits = rearrange(logits, "b ... c -> b (...) c")
                 logits = logits[:, :seq_len]
 
+            inspect_shapes("output", logits=logits.round(decimals=2))
             if use_cache:
                 return logits, cache
             return logits
@@ -688,7 +701,7 @@ class MEGABYTE(nn.Module):
             return loss, preds, labels
         return loss
 
-    def forward(
+    def forward_inference(
         self,
         ids,
         return_loss=False,
@@ -699,6 +712,7 @@ class MEGABYTE(nn.Module):
         profile: bool = False,
         padded: bool = True,
         tok_idx_in_seq=None,
+        streaming=True,
     ):
         batch = ids.shape[0]
         N = ids.shape[1]
@@ -716,6 +730,9 @@ class MEGABYTE(nn.Module):
         ), "caching is curently only supported for batch size == 1"
 
         flattened_dims = ids.ndim == 2
+
+        # if we are streaming and it's not the first token / run
+        is_streaming_continued = streaming and cache is not None
 
         if use_cache and cache is None:
             cache = {}
@@ -787,21 +804,23 @@ class MEGABYTE(nn.Module):
         ):
             if do_profile:
                 start_time = time.time()
-            if use_cache and stage_idx < len(cache["hidden_states"]):
-                hs = cache["hidden_states"][stage_idx]
-                # for networks with higer depth, we need to change this by the product of the subsequent layers
-                scale_factor = self.max_sequence_lengths[stage_idx + 1]
-                # if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
-                if hs is not None and (tok_idx_in_seq + 1) % scale_factor == 0:
-                    # we have cached values for the current step, so we can skip that forward pass
-                    prev_stage_tokens_repr = hs
-                    if do_profile:
-                        cache["profile"][stage_idx].append(time.time() - start_time)
-                    continue
-                print("NOT USING HS CACHE")
-                # if hs is not None:
+            # if use_cache and stage_idx < len(cache["hidden_states"]):
+            #     hs = cache["hidden_states"][stage_idx]
+            #     # for networks with higer depth, we need to change this by the product of the subsequent layers
+            #     scale_factor = self.max_sequence_lengths[stage_idx + 1]
+            #     # if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
+            #     if hs is not None and (tok_idx_in_seq + 1) % scale_factor == 0:
+            #         # we have cached values for the current step, so we can skip that forward pass
+            #         prev_stage_tokens_repr = hs
+            #         if do_profile:
+            #             cache["profile"][stage_idx].append(time.time() - start_time)
+            #         continue
+            #     print("NOT USING HS CACHE")
+            #     # if hs is not None:
 
             stage_tokens, ps = pack_one(stage_tokens, "* n d")
+
+            # if not is_streaming_continued:
             stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
 
             # concat start token
@@ -812,6 +831,7 @@ class MEGABYTE(nn.Module):
                 ),
                 dim=-2,
             )
+            print("stage_tokens", stage_tokens)
 
             # sum the previous hierarchy's representation
             if exists(prev_stage_tokens_repr):
@@ -823,12 +843,24 @@ class MEGABYTE(nn.Module):
             # if DO_HACK:
             #     # TODO this only works for batch size 1 and only during inference without prompt
             #     stage_tokens = stage_tokens[-1].unsqueeze(0)
+
+            bypass_tokenshift = is_streaming_continued and first_stage
+
             if first_stage and self.add_cross_attention:
                 attended, stage_cache = transformer(
-                    stage_tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
+                    stage_tokens,
+                    encoder_hidden_states=encoder_hidden_states,
+                    use_cache=use_cache and first_stage,
+                    cache=stage_cache,
+                    bypass_token_shift=bypass_tokenshift,
                 )
             else:
-                attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache)
+                attended, stage_cache = transformer(
+                    stage_tokens,
+                    use_cache=use_cache and first_stage,
+                    cache=stage_cache,
+                    bypass_token_shift=bypass_tokenshift,
+                )
             # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
             # print("before unpacking: ps: ", ps)
             attended = unpack_one(attended, ps, "* n d")
@@ -845,12 +877,12 @@ class MEGABYTE(nn.Module):
             #     prev_stage_tokens_repr = prev_stage_tokens_repr[-1]
 
             # inspect_shapes(f"attention PROJECTED output stage {stage_idx}", proj=prev_stage_tokens_repr)
-            if use_cache:
-                inspect_shapes(f"out KV of stage {stage_idx}", k=stage_cache[0]["k"])
+            if use_cache and first_stage:
+                # inspect_shapes(f"out KV of stage {stage_idx}", k=stage_cache[0]["k"])
                 cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
-                inspect_shapes(f"out HS of stage {stage_idx}", hs=cache["hidden_states"][stage_idx])
+                # inspect_shapes(f"out HS of stage {stage_idx}", hs=cache["hidden_states"][stage_idx])
             first_stage = False
             if do_profile:
                 cache["profile"][stage_idx].append(time.time() - start_time)
@@ -886,6 +918,253 @@ class MEGABYTE(nn.Module):
             return loss, preds, labels
         return loss
 
+    def embed_tokens(self, ids):
+
+        batch = ids.shape[0]
+        flattened_dims = ids.ndim == 2
+        if flattened_dims:
+            # allow for ids to be given in the shape of (batch, seq)
+            # in which case it will be auto-padded to the next nearest multiple of depth seq len
+            seq_len = ids.shape[-1]
+            multiple_of = reduce_mult(self.max_sequence_lengths[1:])
+            padding = remainder_to_mult(seq_len, multiple_of)
+            ids = F.pad(ids, (0, padding), value=self.pad_token_id)
+            ids = ids.reshape(batch, -1, *self.max_sequence_lengths[1:])
+
+        b, *prec_dims, device = *ids.shape, ids.device
+
+        assert (
+            prec_dims[0] <= self.max_sequence_lengths[0]
+        ), "the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_sequence_lengths (like any autoregressive transformer)"
+
+        assert tuple(prec_dims[1:]) == tuple(
+            self.max_sequence_lengths[1:]
+        ), "all subsequent dimensions must match exactly"
+
+        # get tokens for all hierarchical stages, reducing by appropriate dimensions
+        # and adding the absolute positional embeddings
+
+        tokens_at_stages = []
+        pos_embs = default(self.pos_embs, (None,))
+
+        for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):  # type: ignore
+            is_first = stage_idx == 0
+            inspect_shapes(f"stage {stage_idx} pre token emb", tokens=ids)
+
+            tokens = token_emb(ids)
+
+            if exists(pos_emb):
+                positions = pos_emb(torch.arange(tokens.shape[-2], device=device))
+                tokens = tokens + positions
+
+            tokens_at_stages.insert(0, tokens)
+
+            if is_first:
+                continue
+
+            ids = rearrange(ids, "... m n -> ... (m n)")
+        return tokens_at_stages
+
+    def forward_inference_manual(
+        self,
+        ids,
+        return_loss=False,
+        encoder_hidden_states=None,
+        return_preds_and_labels=False,
+        use_cache=False,
+        cache: Optional[Dict] = None,
+        profile: bool = False,
+        padded: bool = True,
+        tok_idx_in_seq=None,
+        streaming=True,
+    ):
+        print("input ids: ", ids)
+        batch = ids.shape[0]
+        seq_len = ids.shape[-1]
+
+        # print("\n\nCALLING MEGABYTE FORWARD", ids.shape)
+        # inspect_shapes("MEGABYTE", ids=ids)
+        assert ids.ndim in {2, self.stages + 1}
+        assert self.add_cross_attention == (
+            encoder_hidden_states is not None
+        ), "encoder_hidden_states are expected if and only if self.add_cross_attention == True"
+
+        assert not use_cache or self.depth == 2, "cache is only implemented for two-layer MEGABYTE models"
+        assert (
+            not use_cache or len(ids.shape) == 2 and batch == 1
+        ), "caching is curently only supported for batch size == 1"
+        assert self.pos_embs is None, "not yet implemented for models with positional embeddings"
+
+        flattened_dims = ids.ndim == 2
+
+        # if we are streaming and it's not the first token / run
+        is_streaming_continued = streaming and cache is not None
+
+        if use_cache and cache is None:
+            cache = {}
+            cache["kv"] = [None] * self.depth
+            cache["hidden_states"] = [None] * (self.depth - 1)
+            if profile:
+                cache["profile"] = [[] for _ in range(self.depth)]
+
+        do_profile = cache is not None and "profile" in cache
+        if ids.numel() == 0:
+            return self.forward_empty(
+                ids.shape[0], encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
+            )
+        if ids.numel() > 1 and tok_idx_in_seq == 0:
+            # if we have multiple toks and it's the initial run, then we want
+            # to process the whole prompt at once
+            return self.forward_inference(
+                ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
+            )
+
+        assert batch == 1, "currnelyt only batch size 1 supported"
+        assert cache is not None
+        assert tok_idx_in_seq is not None
+
+        embedded_tokens = self.embed_tokens(ids)
+
+        period_0 = self.max_sequence_lengths[-1]
+        period_1 = 1
+
+        if tok_idx_in_seq % period_0 == 0:
+            print("RUNNING INFERENCE ON LAYER 0")
+            stage_tokens = embedded_tokens[0]
+            _, cache = self.forward_stage(
+                0,
+                stage_tokens=stage_tokens,
+                tok_idx_in_seq=tok_idx_in_seq,
+                cache=cache,
+                profile=profile,
+            )
+
+        prev_stage_tokens_repr = cache["hidden_states"][0]
+
+        print("RUNNING INFERENCE ON LAYER 1")
+        stage_tokens = embedded_tokens[1]
+        # these will contain the whole sequence windowed into B, N, n, D where n is the stage context size and N is the number of
+        # windows of size n the sequence is splitted in.
+        # During token-by-token inference we are only interested in the newest window
+        stage_tokens = stage_tokens[:, -1, :, :]
+        attended, cache = self.forward_stage(1, stage_tokens, prev_stage_tokens_repr=prev_stage_tokens_repr, profile=profile, cache=cache)  # type: ignore[]
+
+        logits = self.to_logits(attended)
+        logits = logits[..., 1:, :]
+
+        if flattened_dims:
+            logits = rearrange(logits, "b ... c -> b (...) c")
+            logits = logits[:, :seq_len]
+
+        inspect_shapes("output", logits=logits.round(decimals=2))
+        return logits, cache
+
+    def forward_stage(
+        self,
+        stage_idx,
+        stage_tokens,
+        encoder_hidden_states=None,
+        cache: Optional[Dict] = None,
+        tok_idx_in_seq: int = 0,
+        streaming=True,
+        prev_stage_tokens_repr=None,
+        profile=False,
+    ):
+        assert cache is not None
+        use_cache = True
+        assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
+        assert stage_tokens.ndim == 3
+        if profile:
+            start_time = time.time()
+        if False:
+            # padding here is necessary as the embedding layer expects
+            # multiples of max_sequence_length at the innermost dimension
+            # in the original function, it will take the last n-1 tokens
+            # from the sequence and only pad if necessary. In the token-by-token
+            # prediction this should not be necessary, but needs to be tested.
+            # TODO: check if this degrades the output quality
+            stage_tokens = F.pad(stage_tokens, (0, 3), value=self.pad_token_id).unsqueeze(1)
+            # in the original forward method the embedded
+            # tokens are inserted into the stages list in
+            # reverse order, effectively reversing the token
+            # embedder order
+            token_emb = self.token_embs[self.depth - 1 - stage_idx]
+            inspect_shapes(f"stage {stage_idx} input tokens", tokens=stage_tokens)
+            stage_tokens = token_emb(stage_tokens)
+            inspect_shapes("embedded_tokens", stage_tokens=stage_tokens)
+
+        context_size = reduce_mult(self.max_sequence_lengths[stage_idx:])
+        # The active token is the one we want to process, i.e. the last incoming token
+        # that we want to attend to. Earlier token attention kv's will come from cache
+        active_token_idx = tok_idx_in_seq % context_size
+        print(f"stage {stage_idx} context size: {context_size}, active token: {active_token_idx}")
+
+        if active_token_idx == 0:
+            # if we start a new context window, we need to prepend the start tokens
+            stage_start_tokens = self.start_tokens[stage_idx]
+            stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
+            inspect_shapes(
+                "after pack",
+                stage_tokens=stage_tokens,
+                start_tokens=stage_start_tokens,
+                prev_stage_tokens_repr=prev_stage_tokens_repr,
+            )
+            # concat start token
+            stage_tokens = torch.cat(
+                (
+                    stage_start_tokens,
+                    stage_tokens,
+                ),
+                dim=-2,
+            )
+
+            # also, if we start a new context window, we need to clear the kv cache
+            cache["kv"][stage_idx] = None
+
+        kv_cache = cache["kv"][stage_idx]
+        if prev_stage_tokens_repr is not None:
+            prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
+            stage_tokens = stage_tokens + prev_stage_tokens_repr
+
+        assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
+        
+        if active_token_idx == 0:
+            new_tokens = stage_tokens
+        else:
+            # select only the most recent token (the other ones are padding)
+            # keeping the dims
+            select_idx = active_token_idx if stage_idx != 0 else -1
+            inspect_shapes(f"selecting active token index {select_idx}", stage_tokens=stage_tokens)
+            new_tokens = stage_tokens[..., [select_idx], :]
+
+        bypass_token_shift = tok_idx_in_seq % context_size != 0
+        transformer = self.transformers[stage_idx]
+        if stage_idx == 0 and self.add_cross_attention:
+            attended, kv_cache = transformer(
+                new_tokens,
+                encoder_hidden_states=encoder_hidden_states,
+                use_cache=use_cache,
+                cache=kv_cache,
+                bypass_token_shift=bypass_token_shift,
+            )
+        else:
+            attended, kv_cache = transformer(
+                new_tokens, use_cache=use_cache, cache=kv_cache, bypass_token_shift=bypass_token_shift
+            )
+        # project for next stage in the hierarchy
+
+        proj = self.to_next_transformer_projections[stage_idx]
+        prev_stage_tokens_repr = proj(attended[..., :-1, :])
+        
+        # update cache
+        cache["kv"][stage_idx] = kv_cache  # type: ignore
+        if stage_idx < self.depth - 1:
+            cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()  # type: ignore
+        if profile:
+            cache["profile"][stage_idx].append(time.time() - start_time)  # type: ignore
+
+        return attended, cache
+
 
 if __name__ == "__main__":
 
@@ -901,7 +1180,7 @@ if __name__ == "__main__":
         model,
         prime=None,
         filter_thres=0.9,
-        temperature=1.0,
+        temperature=0.0,
         default_batch_size=1,
     ):
 
@@ -926,12 +1205,63 @@ if __name__ == "__main__":
             # cache = {'profile': [[], []], 'hidden_states': [None, None], 'kv': [[],[]]}
             cache = None
             x = prime
-            use_old_algo = True
-            for tok_idx in range(32):
-                print("GENERATING ", tok_idx, time.time())
-                if not use_old_algo:
-                    logits, cache = model.forward(
-                        ids=x, use_cache=True, cache=cache, profile=False, padded=False, tok_idx_in_seq=tok_idx
+
+            seq2 = prime
+            # cache = {'profile': [[], []], 'hidden_states': [None, None], 'kv': [[],[]]}
+            seq_len2 = seq.shape[-1]
+            cache2 = None
+            x2 = prime
+            manual = False
+            use_same_sequence_for_both = True
+            for tok_idx in range(5):
+
+                print("\n", "*" * 90)
+                if True:
+
+                    use_old_algo = True
+                    print("GENRATING  NON MANUAL", tok_idx, time.time(), "\n")
+                    if not use_old_algo:
+                        # logits, cache2 = model.forward_inference(
+                        #     ids=x,
+                        #     use_cache=True,
+                        #     cache=cache2,
+                        #     profile=False,
+                        #     padded=False,
+                        #     tok_idx_in_seq=tok_idx,
+                        #     streaming=True,
+                        # )
+                        # # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+                        # inspect_shapes("LOGINTS", logits=logits)
+                        # logits = logits[:, -1]
+                        # logits = top_k(logits, thres=filter_thres)
+                        # sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+                        # seq_len += 1
+                        # x = rearrange(sampled, "b -> b 1")
+                        # seq = torch.cat((seq, x), dim=-1)
+                        # x = seq
+                        pass
+                    else:
+                        print("x2.shape", x2.shape)
+                        logits = model.forward(ids=x2, use_cache=False, cache=cache, profile=False)
+                        # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
+                        # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+                        logits = logits[:, -1]
+                        logits = top_k(logits, thres=filter_thres)
+                        sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+                        seq_len2 += 1
+                        x2 = rearrange(sampled, "b -> b 1")
+                        seq2 = torch.cat((seq2, x2), dim=-1)
+                        x2 = seq2
+                if True:
+                    print("\nGENERATING  MANUAL ", tok_idx, time.time(), "\n")
+                    logits, cache = model.forward_inference_manual(
+                        ids=x,
+                        use_cache=True,
+                        cache=cache,
+                        profile=False,
+                        padded=False,
+                        tok_idx_in_seq=tok_idx,
+                        streaming=True,
                     )
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                     logits = logits[:, -1]
@@ -940,25 +1270,20 @@ if __name__ == "__main__":
                     seq_len += 1
                     x = rearrange(sampled, "b -> b 1")
                     seq = torch.cat((seq, x), dim=-1)
-                    # x = seq
-                else:
-                    logits = model.forward_old(ids=x, use_cache=False, cache=cache, profile=False)
-                    # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
-                    # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-                    logits = logits[:, -1]
-                    logits = top_k(logits, thres=filter_thres)
-                    sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
-                    seq_len += 1
-                    x = rearrange(sampled, "b -> b 1")
-                    seq = torch.cat((seq, x), dim=-1)
-                    x = seq
+                    if use_same_sequence_for_both:
+                        x = seq2.clone()
+                    else:
+                        x = seq
+
             dur = time.time() - start_time
             print(f"Generated {seq_len} tokens in {dur:.2f} seconds ({seq_len/dur:.1f} tokens/s)")
+            print("Non manual seq:", seq2)
+            print("Manual seq    :", seq)
             return seq.reshape(batch, seq_len).flatten(-1), cache
 
-    prime = None  # torch.zeros((1, 3), dtype = torch.long, device = 'cuda')
+    prime = torch.zeros((1, 1), dtype=torch.long, device="cuda")
     model = MEGABYTE(
-        vocab_size=5,
+        vocab_size=6,
         hidden_sizes=(3, 2),
         num_hidden_layers=(1, 1),
         max_sequence_lengths=(8, 4),
@@ -970,3 +1295,92 @@ if __name__ == "__main__":
     model.eval()
     Y, cache = generate_few(model, prime=prime, temperature=0.5, default_batch_size=1)
     print(Y)
+
+    # def generate_few_old(
+    #     model,
+    #     prime=None,
+    #     filter_thres=0.9,
+    #     temperature=1.0,
+    #     default_batch_size=1,
+    # ):
+    #
+    #     model.eval()
+    #
+    #     start_time = time.time()
+    #
+    #     with torch.inference_mode():
+    #
+    #         # total_seq_len = reduce_mult(model.max_sequence_lengths)
+    #         device = "cuda"
+    #         # print(device)
+    #
+    #         if not exists(prime):
+    #             prime = torch.empty((default_batch_size, 0), dtype=torch.long, device=device)
+    #         prime = prime.to(device)
+    #
+    #         seq = prime
+    #         batch = seq.shape[0]
+    #
+    #         seq_len = seq.shape[-1]
+    #         # cache = {'profile': [[], []], 'hidden_states': [None, None], 'kv': [[],[]]}
+    #         cache = None
+    #         x = prime
+    #         manual = False
+    #         if manual:
+    #             for tok_idx in range(32):
+    #                 print("\nGENERATING ", tok_idx, time.time(), "\n")
+    #                 logits, cache = model.forward_inference_manual(
+    #                     ids=x,
+    #                     use_cache=True,
+    #                     cache=cache,
+    #                     profile=False,
+    #                     padded=False,
+    #                     tok_idx_in_seq=tok_idx,
+    #                     streaming=True,
+    #                 )
+    #                 # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+    #                 logits = logits[:, -1]
+    #                 logits = top_k(logits, thres=filter_thres)
+    #                 sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+    #                 seq_len += 1
+    #                 x = rearrange(sampled, "b -> b 1")
+    #                 seq = torch.cat((seq, x), dim=-1)
+    #
+    #         else:
+    #
+    #             use_old_algo = True
+    #             for tok_idx in range(32):
+    #                 print("\nGENERATING ", tok_idx, time.time(), "\n")
+    #                 if not use_old_algo:
+    #                     logits, cache = model.forward_inference(
+    #                         ids=x,
+    #                         use_cache=True,
+    #                         cache=cache,
+    #                         profile=False,
+    #                         padded=False,
+    #                         tok_idx_in_seq=tok_idx,
+    #                         streaming=True,
+    #                     )
+    #                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+    #                     inspect_shapes("LOGINTS", logits=logits)
+    #                     logits = logits[:, -1]
+    #                     logits = top_k(logits, thres=filter_thres)
+    #                     sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+    #                     seq_len += 1
+    #                     x = rearrange(sampled, "b -> b 1")
+    #                     seq = torch.cat((seq, x), dim=-1)
+    #                     # x = seq
+    #                 else:
+    #                     logits = model.forward(ids=x, use_cache=False, cache=cache, profile=False)
+    #                     # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
+    #                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+    #                     logits = logits[:, -1]
+    #                     logits = top_k(logits, thres=filter_thres)
+    #                     sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+    #                     seq_len += 1
+    #                     x = rearrange(sampled, "b -> b 1")
+    #                     seq = torch.cat((seq, x), dim=-1)
+    #                     x = seq
+    #         dur = time.time() - start_time
+    #         print(f"Generated {seq_len} tokens in {dur:.2f} seconds ({seq_len/dur:.1f} tokens/s)")
+    #         return seq.reshape(batch, seq_len).flatten(-1), cache
