@@ -23,8 +23,10 @@ import pprint
 # helpers
 
 
-def inspect_shapes(prefix, **tensors):
+def inspect_shapes(prefix, *, suppress=False, print_values=False, select=lambda x: x, **tensors):
     if False:
+        return
+    if suppress:
         return
     shapes = [f"{k}={tuple(x for x in v.shape)}" for k, v in tensors.items() if v is not None]
     import numpy as np
@@ -32,7 +34,10 @@ def inspect_shapes(prefix, **tensors):
     np.set_printoptions(precision=2)
     print(f"{prefix}: {shapes}")
     # vals = [f"{k}={tuple(x for x in v.cpu().numpy())}" for k, v in tensors.items()]
-    vals = {k: str(hash(str(v.cpu().numpy())))[-5:] for k, v in tensors.items() if v is not None}
+    if print_values:
+        vals = {k: select(v.cpu().numpy()) for k, v in tensors.items() if v is not None}
+    else:
+        vals = {k: str(hash(str(select(v.cpu().numpy()))))[-5:] for k, v in tensors.items() if v is not None}
     # vals = []
     # import numpy as np
     # for k, v in tensors.items():
@@ -274,8 +279,8 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(dim)
         self.has_cross_attention = has_cross_attention
 
-    def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None, bypass_token_shift=False):
-        inspect_shapes("Transformer", x=x)
+    def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None, bypass_token_shift=False, debug=False):
+        inspect_shapes("Transformer", suppress=(not debug), print_values=True, x=x)
         n = x.shape[-2]
         rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None  # type: ignore
 
@@ -320,8 +325,10 @@ class Transformer(nn.Module):
                 x = ff(token_shift(x, bypass=bypass_token_shift)) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
-
-        return self.norm(x), cache
+        inspect_shapes("transofrmer out pre norm", suppress=(not debug), print_values=True, x=x)
+        x = self.norm(x)
+        inspect_shapes("transofrmer out post norm", suppress=(not debug), x=x)
+        return x, cache
 
 
 # main class
@@ -593,7 +600,9 @@ class MEGABYTE(nn.Module):
             self.transformers,
             self.to_next_transformer_projections,
         ):
-            inspect_shapes(f"STAGE {stage_idx}", stage_tokens=stage_tokens, start_tokens=stage_start_tokens)
+            inspect_shapes(
+                f"STAGE {stage_idx}", print_values=False, stage_tokens=stage_tokens, start_tokens=stage_start_tokens
+            )
             # print(stage_tokens)
             if do_profile:
                 start_time = time.time()
@@ -615,6 +624,8 @@ class MEGABYTE(nn.Module):
             stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
             inspect_shapes(
                 "after pack",
+                print_values=True,
+                select=lambda x: x[-1],
                 stage_tokens=stage_tokens,
                 start_tokens=stage_start_tokens,
                 prev_stage_tokens_repr=prev_stage_tokens_repr,
@@ -635,7 +646,7 @@ class MEGABYTE(nn.Module):
                 stage_tokens = stage_tokens + prev_stage_tokens_repr
 
             stage_cache = cache["kv"][stage_idx] if cache else None
-            # inspect_shapes(f"stage tokens to transormer {stage_idx}", stage_tokens=stage_tokens)
+            inspect_shapes(f"stage tokens to transormer {stage_idx}", stage_tokens=stage_tokens[-1:])
             # if DO_HACK:
             #     # TODO this only works for batch size 1 and only during inference without prompt
             #     stage_tokens = stage_tokens[-1].unsqueeze(0)
@@ -644,7 +655,7 @@ class MEGABYTE(nn.Module):
                     stage_tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
                 )
             else:
-                attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache)
+                attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache, debug=first_stage)
             # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
             # print("before unpacking: ps: ", ps)
             attended = unpack_one(attended, ps, "* n d")
@@ -1098,13 +1109,16 @@ class MEGABYTE(nn.Module):
         # that we want to attend to. Earlier token attention kv's will come from cache
         active_token_idx = tok_idx_in_seq % context_size
         print(f"stage {stage_idx} context size: {context_size}, active token: {active_token_idx}")
-
         if active_token_idx == 0:
             # if we start a new context window, we need to prepend the start tokens
             stage_start_tokens = self.start_tokens[stage_idx]
             stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
             inspect_shapes(
+                f"STAGE {stage_idx}", print_values=False, stage_tokens=stage_tokens, start_tokens=stage_start_tokens
+            )
+            inspect_shapes(
                 "after pack",
+                print_values=True,
                 stage_tokens=stage_tokens,
                 start_tokens=stage_start_tokens,
                 prev_stage_tokens_repr=prev_stage_tokens_repr,
@@ -1127,16 +1141,18 @@ class MEGABYTE(nn.Module):
             stage_tokens = stage_tokens + prev_stage_tokens_repr
 
         assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
-        
+
         if active_token_idx == 0:
             new_tokens = stage_tokens
         else:
             # select only the most recent token (the other ones are padding)
             # keeping the dims
             select_idx = active_token_idx if stage_idx != 0 else -1
-            inspect_shapes(f"selecting active token index {select_idx}", stage_tokens=stage_tokens)
+            inspect_shapes(f"selecting active token index {select_idx}", print_values=True, stage_tokens=stage_tokens)
             new_tokens = stage_tokens[..., [select_idx], :]
 
+        if stage_idx == 0:
+            pass
         bypass_token_shift = tok_idx_in_seq % context_size != 0
         transformer = self.transformers[stage_idx]
         if stage_idx == 0 and self.add_cross_attention:
@@ -1149,16 +1165,24 @@ class MEGABYTE(nn.Module):
             )
         else:
             attended, kv_cache = transformer(
-                new_tokens, use_cache=use_cache, cache=kv_cache, bypass_token_shift=bypass_token_shift
+                new_tokens, use_cache=use_cache, cache=kv_cache, bypass_token_shift=bypass_token_shift, debug=stage_idx == 0
             )
         # project for next stage in the hierarchy
 
         proj = self.to_next_transformer_projections[stage_idx]
-        prev_stage_tokens_repr = proj(attended[..., :-1, :])
-        
+        to_next_layer = attended[..., :-1, :] if attended.shape[-2] > 1 else attended
+        prev_stage_tokens_repr = proj(to_next_layer)
+
         # update cache
+        # inspect_shapes(f"output cache {stage_idx}", v=kv_cache[0]["v"])
         cache["kv"][stage_idx] = kv_cache  # type: ignore
         if stage_idx < self.depth - 1:
+            # inspect_shapes(
+            #     "updating hs cache",
+            #     print_values=True,
+            #     current=cache["hidden_states"][stage_idx],
+            #     new_line=prev_stage_tokens_repr.detach().clone(),
+            # )
             cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()  # type: ignore
         if profile:
             cache["profile"][stage_idx].append(time.time() - start_time)  # type: ignore
@@ -1213,8 +1237,8 @@ if __name__ == "__main__":
             x2 = prime
             manual = False
             use_same_sequence_for_both = True
-            for tok_idx in range(5):
-
+            for tok_idx in range(12):
+                non_manual_logits = None
                 print("\n", "*" * 90)
                 if True:
 
@@ -1246,6 +1270,8 @@ if __name__ == "__main__":
                         # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
                         # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                         logits = logits[:, -1]
+                        non_manual_logits = logits
+                        inspect_shapes("NON MANUAL LOGITS", print_values=True, logits=logits)
                         logits = top_k(logits, thres=filter_thres)
                         sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
                         seq_len2 += 1
@@ -1265,6 +1291,9 @@ if __name__ == "__main__":
                     )
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                     logits = logits[:, -1]
+                    inspect_shapes("MANUAL LOGITS", print_values=True, logits=logits)
+                    # if torch.any(logits.round(decimals=3) != non_manual_logits.round(decimals=3)):  # type: ignore
+                    #     assert False, "Results are not equal"
                     logits = top_k(logits, thres=filter_thres)
                     sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
                     seq_len += 1
