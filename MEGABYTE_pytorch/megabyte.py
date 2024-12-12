@@ -232,17 +232,17 @@ class Attention(nn.Module):
     def forward(self, x, rotary_emb=None, encoder_hidden_states=None, use_cache=False, cache=None):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
         h = self.heads
-        if use_cache and cache is not None:
-            if "input" in cache:
-                input = torch.cat((cache["input"], x), dim=-2)
-                cache["input"] = input
-            else:
-                cache["input"] = x.clone()
-                input = x
-        else:
-            input = x
-        x = self.norm(input)
-        inspect_shapes("Attend input", print_values=True, post_norm=x, pre_norm=input)
+        # if False and use_cache and cache is not None:
+        #     if "input" in cache:
+        #         input = torch.cat((cache["input"], x), dim=-2)
+        #         cache["input"] = input
+        #     else:
+        #         cache["input"] = x.clone()
+        #         input = x
+        # else:
+        #     input = x
+        x = self.norm(x)
+        # inspect_shapes("Attend input", print_values=True, post_norm=x, pre_norm=input)
         # print("ATTEND INPUT \n", x, "\nEND")
         if self.is_cross_attention:
             q, k, v = (self.to_q(x), *self.to_kv(encoder_hidden_states).chunk(2, dim=-1))
@@ -267,22 +267,23 @@ class Attention(nn.Module):
         #         cache = {"input": input.clone(), "k": k.clone(), "v": v.clone()}
         if use_cache:
             assert cache is not None, "You must provide an empty dict as cache for the inital run"
-            in_cache = get_cache(cache, "input")
+            # in_cache = get_cache(cache, "input")
             k_cache = get_cache(cache, "k")
             v_cache = get_cache(cache, "v")
-            if k_cache is not None and v_cache is not None and in_cache is not None:
-                input = torch.cat((in_cache, input), dim=2)
+            if k_cache is not None and v_cache is not None:  # and in_cache is not None:
+                # input = torch.cat((in_cache, input), dim=2)
                 k = torch.cat((k_cache, k), dim=2)
                 v = torch.cat((v_cache, v), dim=2)
-            set_cache(cache, input=input, k=k, v=v)
+            set_cache(cache, k=k, v=v)
             print("kv cache: ", cache["v"].shape)
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
 
-        # inspect_shapes("pre_attend", q=q, k=k, v=v)
+        # inspect_shapes("pre_attend", print_values=True, q=q, k=k, v=v)
         # print("v", v)
 
         out = self.attend(q, k, v)
+        inspect_shapes("attend direct out", print_values=True, out=out)
 
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out), cache
@@ -363,8 +364,8 @@ class Transformer(nn.Module):
 
                 # layer_cache = cache[layer_idx] if cache is not None else None
                 layer_cache = get_cache(cache, layer_idx, init=True)
-                shifted, cache0 = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_0"))
-                set_cache(layer_cache, "tok_shift_0", cache0)
+                shifted, shift_cache = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_0"))
+                set_cache(layer_cache, "tok_shift_0", shift_cache)
                 attended, layer_cache = attn(
                     shifted,
                     rotary_emb=rotary_emb,
@@ -386,8 +387,8 @@ class Transformer(nn.Module):
         else:
             for layer_idx, (attn, ff) in enumerate(self.layers):  # type: ignore
                 layer_cache = get_cache(cache, layer_idx, init=True)
-                shifted, cache0 = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_0"))
-                set_cache(layer_cache, "tok_shift_0", cache0)
+                shifted, shift_cache = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_0"))
+                set_cache(layer_cache, "tok_shift_0", shift_cache)
                 attended, layer_cache = attn(
                     shifted,
                     rotary_emb=rotary_emb,
@@ -395,13 +396,28 @@ class Transformer(nn.Module):
                     cache=layer_cache,
                     # x, rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
                 )
+                inspect_shapes("attn out", suppress=(not debug), print_values=True, attended=attended)
                 x = attended + x
-                x = ff(token_shift(x)) + x
+
+                shifted, shift_cache = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_1"))
+                set_cache(layer_cache, "tok_shift_1", shift_cache)
+                x = ff(shifted) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
         inspect_shapes("transofrmer out pre norm", suppress=(not debug), print_values=True, x=x)
-        x = self.norm(x)
-        inspect_shapes("transofrmer out post norm", suppress=(not debug), x=x)
+        pre_norm_history = get_cache(cache, 'pre_norm', init=False)
+        orig_shape = x.shape
+        if pre_norm_history is not None:
+            norm_in = torch.cat((pre_norm_history, x), dim=-2)
+        else:
+            norm_in = x
+        x = self.norm(norm_in)
+        inspect_shapes("norm", suppress=(not debug), print_values=True, norm_in=norm_in, norm_out=x)
+        set_cache(cache, pre_norm=norm_in)
+        # if x.shape != orig_shape:
+        #     keep = orig_shape[-2]
+        #     x = x[:, -keep:, :]
+        inspect_shapes("transofrmer out post norm", suppress=(not debug), print_values=True, x=x)
         return x, cache
 
 
@@ -648,7 +664,7 @@ class MEGABYTE(nn.Module):
 
         for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
             is_first = stage_idx == 0
-            inspect_shapes(f"stage {stage_idx} pre token emb", tokens=ids)
+            # inspect_shapes(f"stage {stage_idx} pre token emb", tokens=ids)
 
             tokens = token_emb(ids)
 
@@ -1039,7 +1055,7 @@ class MEGABYTE(nn.Module):
 
         for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):  # type: ignore
             is_first = stage_idx == 0
-            inspect_shapes(f"stage {stage_idx} pre token emb", tokens=ids)
+            # inspect_shapes(f"stage {stage_idx} pre token emb", tokens=ids)
 
             tokens = token_emb(ids)
 
@@ -1387,8 +1403,8 @@ if __name__ == "__main__":
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                     logits = logits[:, -1]
                     inspect_shapes("MANUAL LOGITS", print_values=True, logits=logits)
-                    # if torch.any(logits.round(decimals=3) != non_manual_logits.round(decimals=3)):  # type: ignore
-                    #     assert False, "Results are not equal"
+                    if torch.any(logits.round(decimals=3) != non_manual_logits.round(decimals=3)):  # type: ignore
+                        assert False, "Results are not equal"
                     logits = top_k(logits, thres=filter_thres)
                     sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
                     seq_len += 1
