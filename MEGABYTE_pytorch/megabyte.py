@@ -1066,13 +1066,10 @@ class MEGABYTE(nn.Module):
     def forward_inference_manual(
         self,
         ids,
-        return_loss=False,
         encoder_hidden_states=None,
-        return_preds_and_labels=False,
         use_cache=False,
         cache: Optional[Dict] = None,
         profile: bool = False,
-        padded: bool = True,
         tok_idx_in_seq=None,
         streaming=True,
     ):
@@ -1140,6 +1137,7 @@ class MEGABYTE(nn.Module):
                 cache=cache,
                 profile=profile,
                 run_full_sequence_attention=True,
+                encoder_hidden_states=encoder_hidden_states
             )
 
         prev_stage_tokens_repr = get_cache(cache, "prev_stage_tokens_repr", init=False)
@@ -1377,7 +1375,6 @@ if __name__ == "__main__":
                         use_cache=True,
                         cache=cache,
                         profile=False,
-                        padded=False,
                         tok_idx_in_seq=tok_idx,
                         streaming=True,
                     )
