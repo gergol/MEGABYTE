@@ -191,9 +191,9 @@ def set_cache(
     if isinstance(cache, dict):
         if key is not None:
             assert value is not None
-            cache[key] = value.clone()
+            cache[key] = value.clone().float()
         for k, v in entries.items():
-            cache[k] = v.clone()
+            cache[k] = v.clone().float()
     return cache
 
 
@@ -240,46 +240,18 @@ class Attention(nn.Module):
     def forward(self, x, rotary_emb=None, encoder_hidden_states=None, use_cache=False, cache=None):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
         h = self.heads
-        # if False and use_cache and cache is not None:
-        #     if "input" in cache:
-        #         input = torch.cat((cache["input"], x), dim=-2)
-        #         cache["input"] = input
-        #     else:
-        #         cache["input"] = x.clone()
-        #         input = x
-        # else:
-        #     input = x
         x = self.norm(x)
-        # inspect_shapes("Attend input", print_values=True, post_norm=x, pre_norm=input)
-        # print("ATTEND INPUT \n", x, "\nEND")
         if self.is_cross_attention:
             q, k, v = (self.to_q(x), *self.to_kv(encoder_hidden_states).chunk(2, dim=-1))
         else:
             q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim=-1))
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
-        # if use_cache:
-        #     if cache is not None:
-        #         # print("READING FROM CHACHE")
-        #         in_cache = cache.get("input")
-        #         k_cache = cache.get("k")
-        #         v_cache = cache.get("v")
-        #         if k_cache is not None and v_cache is not None and in_cache is not None:
-        #             input = in_cache.cat((in_cache, input), dim=2)
-        #             k = torch.cat((k_cache, k), dim=2)
-        #             v = torch.cat((v_cache, v), dim=2)
-        #         cache["input"] = input.clone()
-        #         cache["k"] = k.clone()
-        #         cache["v"] = v.clone()
-        #     else:
-        #         cache = {"input": input.clone(), "k": k.clone(), "v": v.clone()}
         if use_cache:
             assert cache is not None, "You must provide an empty dict as cache for the inital run"
-            # in_cache = get_cache(cache, "input")
             k_cache = get_cache(cache, "k")
             v_cache = get_cache(cache, "v")
             if k_cache is not None and v_cache is not None:  # and in_cache is not None:
-                # input = torch.cat((in_cache, input), dim=2)
                 k = torch.cat((k_cache, k), dim=2)
                 v = torch.cat((v_cache, v), dim=2)
             set_cache(cache, k=k, v=v)
@@ -287,10 +259,7 @@ class Attention(nn.Module):
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
 
-        # inspect_shapes("pre_attend", print_values=True, q=q, k=k, v=v)
-        # print("v", v)
-
-        out = self.attend(q, k, v)
+        out = self.attend(q.float(), k.float(), v.float())
         inspect_shapes("attend direct out", suppress=True, print_values=True, out=out)
 
         out = rearrange(out, "b h n d -> b n (h d)")
@@ -355,6 +324,8 @@ class Transformer(nn.Module):
         self.has_cross_attention = has_cross_attention
 
     def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None, debug=False):
+        assert not use_cache
+        assert cache is None
         inspect_shapes("Transformer", suppress=(not debug), print_values=True, x=x)
         n = x.shape[-2]
         rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None  # type: ignore
@@ -368,7 +339,6 @@ class Transformer(nn.Module):
                 if self.use_old_layout:
                     cross_attn, ff = ff, cross_attn  # swap the variable names to match the old layout if needed
 
-                # layer_cache = cache[layer_idx] if cache is not None else None
                 layer_cache = get_cache(cache, layer_idx, init=True)
                 shifted, shift_cache = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_0"))
                 set_cache(layer_cache, "tok_shift_0", shift_cache)
@@ -377,17 +347,25 @@ class Transformer(nn.Module):
                     rotary_emb=rotary_emb,
                     use_cache=use_cache,
                     cache=layer_cache,
+                    # x, rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
                 )
+                inspect_shapes("attn out", suppress=(not debug), print_values=True, attended=attended)
                 x = attended + x
+
+                shifted, shift_cache = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_1"))
+                set_cache(layer_cache, "tok_shift_1", shift_cache)
+
                 x = (
                     cross_attn(
-                        token_shift(x),
+                        shifted,
                         rotary_emb=rotary_emb,
                         encoder_hidden_states=encoder_hidden_states,
                     )[0]
                     + x
                 )
-                x = ff(token_shift(x)) + x
+                shifted, shift_cache = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_2"))
+                set_cache(layer_cache, "tok_shift_2", shift_cache)
+                x = ff(shifted) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
         else:
@@ -560,10 +538,11 @@ class MEGABYTE(nn.Module):
     def depth(self):
         return len(self.max_sequence_lengths)
 
-    def forward_empty(self, batch_size, encoder_hidden_states=None, use_cache=False, cache=None):
+    def forward_empty(self, batch_size, encoder_hidden_states=None, use_cache=False, cache=None, use_kv_cache=None):
         # take care of special case
         # where you sample from input of 0 (start token only)
-
+        if use_kv_cache is None:
+            use_kv_cache = use_cache
         prev_stage_tokens_repr = None
 
         is_first_stage = True
@@ -582,19 +561,28 @@ class MEGABYTE(nn.Module):
 
             stage_cache = cache["kv"][stage_idx] if cache else None
             inspect_shapes(f"forward_empty TF input stage {stage_idx}", print_values=True, tokens=tokens)
-            if is_first_stage:
-                tokens, stage_cache = transformer(
-                    tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
-                )
-                is_first_stage = False
+            if use_kv_cache:
+                if is_first_stage:
+                    tokens, stage_cache = transformer(
+                        tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
+                    )
+                    is_first_stage = False
+                else:
+                    tokens, stage_cache = transformer(tokens, use_cache=use_cache, cache=stage_cache)
             else:
-                tokens, stage_cache = transformer(tokens, use_cache=use_cache, cache=stage_cache)
+                if is_first_stage:
+                    tokens, _ = transformer(
+                        tokens, encoder_hidden_states=encoder_hidden_states, use_cache=False, cache=None
+                    )
+                    is_first_stage = False
+                else:
+                    tokens, _ = transformer(tokens, use_cache=False, cache=None)
             prev_stage_tokens_repr = proj(tokens)
-            if use_cache:
+            if use_kv_cache:
                 inspect_shapes(f"out (forward_empty) KV of stage {stage_idx}", k=stage_cache[0]["k"])
                 cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
-                cache["hidden_states"][stage_idx] = prev_stage_tokens_repr
+                cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.float()
 
         if use_cache:
             return self.to_logits(tokens), cache  # type: ignore
@@ -1121,7 +1109,11 @@ class MEGABYTE(nn.Module):
         do_profile = cache is not None and "profile" in cache
         if ids.numel() == 0:
             return self.forward_empty(
-                ids.shape[0], encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
+                ids.shape[0],
+                encoder_hidden_states=encoder_hidden_states,
+                use_cache=use_cache,
+                cache=cache,
+                use_kv_cache=False,
             )
         if ids.numel() > 1 and tok_idx_in_seq == 0:
             # if we have multiple toks and it's the initial run, then we want
@@ -1147,6 +1139,7 @@ class MEGABYTE(nn.Module):
                 tok_idx_in_seq=tok_idx_in_seq,
                 cache=cache,
                 profile=profile,
+                run_full_sequence_attention=True,
             )
 
         prev_stage_tokens_repr = get_cache(cache, "prev_stage_tokens_repr", init=False)
@@ -1159,14 +1152,14 @@ class MEGABYTE(nn.Module):
         # windows of size n the sequence is splitted in.
         # During token-by-token inference we are only interested in the newest window
         stage_tokens = stage_tokens[:, -1, :, :]
-        attended, cache = self.forward_stage(1, stage_tokens, prev_stage_tokens_repr=prev_stage_tokens_repr, profile=profile, cache=cache)  # type: ignore[]
+        attended, cache = self.forward_stage(1, stage_tokens, prev_stage_tokens_repr=prev_stage_tokens_repr, profile=profile, cache=cache, run_full_sequence_attention=True)  # type: ignore[]
 
         set_cache(cache, "prev_stage_tokens_repr", cache["hidden_states"][0])
 
         logits = self.to_logits(attended)
 
         logits_idx = ((tok_idx_in_seq - 1) % self.max_sequence_lengths[-1]) + 1
-        inspect_shapes("output raw", print_values=True, logits=logits.round(decimals=2), attended=attended)
+        inspect_shapes("output raw", print_values=False, logits=logits.round(decimals=2), attended=attended)
         logits = logits[..., logits_idx : logits_idx + 1, :]
         if flattened_dims:
             logits = rearrange(logits, "b ... c -> b (...) c")
@@ -1185,45 +1178,23 @@ class MEGABYTE(nn.Module):
         streaming=True,
         prev_stage_tokens_repr=None,
         profile=False,
+        run_full_sequence_attention=False,
     ):
         assert cache is not None
-        use_cache = True
+        use_cache = not run_full_sequence_attention
         assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
         assert stage_tokens.ndim == 3
         if profile:
             start_time = time.time()
-        if False:
-            # padding here is necessary as the embedding layer expects
-            # multiples of max_sequence_length at the innermost dimension
-            # in the original function, it will take the last n-1 tokens
-            # from the sequence and only pad if necessary. In the token-by-token
-            # prediction this should not be necessary, but needs to be tested.
-            # TODO: check if this degrades the output quality
-            stage_tokens = F.pad(stage_tokens, (0, 3), value=self.pad_token_id).unsqueeze(1)
-            # in the original forward method the embedded
-            # tokens are inserted into the stages list in
-            # reverse order, effectively reversing the token
-            # embedder order
-            token_emb = self.token_embs[self.depth - 1 - stage_idx]
-            inspect_shapes(f"stage {stage_idx} input tokens", tokens=stage_tokens)
-            stage_tokens = token_emb(stage_tokens)
-            inspect_shapes("embedded_tokens", stage_tokens=stage_tokens)
 
         context_size = reduce_mult(self.max_sequence_lengths[stage_idx:])
         # The active token is the one we want to process, i.e. the last incoming token
         # that we want to attend to. Earlier token attention kv's will come from cache
         active_token_idx = tok_idx_in_seq % context_size
         dprint(f"stage {stage_idx} context size: {context_size}, active token: {active_token_idx}")
-        # TODO HIER WEITER:
-        # das problem ist, dass in der original implementation immer das stage_token des letzten paketes
-        # verwendet wird, da der letzte wert discarded wird. das istdenke ich laut paper nicht korrekt,
-        # aber ich muss es so modellieren, da sonst nur crap rauskommt.
-        # d.h. in ganz am beginn in stage 0 muss ich nur das start token in den transformer jagen,
-        # danach dann immer den neuen state zu n -1 generieren, i.e. beim index 3, 7, 11, usw.
-        # wahrscheinlcih kann ich einfach nur einen inital run ausserhalb des loops machen, und dann
-        # die stage 0 NACH der stage 1 zu den entsprechenden indices aufrufen...
+        inspect_shapes(f"STAGE INPUT TOKOENS {stage_idx}", stage_tokens=stage_tokens)
 
-        if active_token_idx == 0:
+        if active_token_idx == 0 or run_full_sequence_attention:
             # if we start a new context window, we need to prepend the start tokens
             stage_start_tokens = self.start_tokens[stage_idx]
             stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
@@ -1256,7 +1227,7 @@ class MEGABYTE(nn.Module):
 
         assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
 
-        if active_token_idx == 0:
+        if active_token_idx == 0 or run_full_sequence_attention:
             new_tokens = stage_tokens
         else:
             # select only the most recent token (the other ones are padding)
@@ -1269,10 +1240,6 @@ class MEGABYTE(nn.Module):
                 stage_tokens=stage_tokens,
             )
             new_tokens = stage_tokens[..., [select_idx], :]
-
-        if stage_idx == 0:
-            pass
-        # bypass_token_shift = tok_idx_in_seq % context_size != 0
         transformer = self.transformers[stage_idx]
         if stage_idx == 0 and self.add_cross_attention:
             attended, kv_cache = transformer(
@@ -1285,7 +1252,7 @@ class MEGABYTE(nn.Module):
             attended, kv_cache = transformer(
                 new_tokens,
                 use_cache=use_cache,
-                cache=kv_cache,
+                cache=kv_cache if use_cache else None,
                 debug=False,
             )
         # project for next stage in the hierarchy
@@ -1305,7 +1272,7 @@ class MEGABYTE(nn.Module):
             #     current=cache["hidden_states"][stage_idx],
             #     new_line=prev_stage_tokens_repr.detach().clone(),
             # )
-            cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()  # type: ignore
+            cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone().float()  # type: ignore
         if profile:
             cache["profile"][stage_idx].append(time.time() - start_time)  # type: ignore
 
@@ -1438,10 +1405,10 @@ if __name__ == "__main__":
     # prime = torch.zeros((1, 1), dtype=torch.long, device="cuda")
     prime = None
     model = MEGABYTE(
-        vocab_size=6,
+        vocab_size=60,
         hidden_sizes=(3, 2),
         num_hidden_layers=(1, 1),
-        max_sequence_lengths=(8, 4),
+        max_sequence_lengths=(384, 4),
         dim_head=2,
         num_heads=2,
     )
