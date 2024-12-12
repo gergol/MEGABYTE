@@ -798,7 +798,7 @@ class MEGABYTE(nn.Module):
             return loss, preds, labels
         return loss
 
-    def forward_inference(
+    def forward_inference_prompt(
         self,
         ids,
         return_loss=False,
@@ -807,8 +807,6 @@ class MEGABYTE(nn.Module):
         use_cache=False,
         cache: Optional[Dict] = None,
         profile: bool = False,
-        padded: bool = True,
-        tok_idx_in_seq=None,
         streaming=True,
     ):
         batch = ids.shape[0]
@@ -1063,15 +1061,13 @@ class MEGABYTE(nn.Module):
             ids = rearrange(ids, "... m n -> ... (m n)")
         return tokens_at_stages
 
-    def forward_inference_manual(
+    def forward_inference(
         self,
         ids,
         encoder_hidden_states=None,
         use_cache=False,
         cache: Optional[Dict] = None,
         profile: bool = False,
-        tok_idx_in_seq=None,
-        streaming=True,
     ):
         dprint("input ids: ", ids)
         batch = ids.shape[0]
@@ -1093,9 +1089,7 @@ class MEGABYTE(nn.Module):
 
         flattened_dims = ids.ndim == 2
 
-        # if we are streaming and it's not the first token / run
-        is_streaming_continued = streaming and cache is not None
-
+        run_prompt = ids.numel() > 1 and cache is None
         if use_cache and cache is None:
             cache = {}
             cache["kv"] = [None] * self.depth
@@ -1103,7 +1097,6 @@ class MEGABYTE(nn.Module):
             if profile:
                 cache["profile"] = [[] for _ in range(self.depth)]
 
-        do_profile = cache is not None and "profile" in cache
         if ids.numel() == 0:
             return self.forward_empty(
                 ids.shape[0],
@@ -1112,21 +1105,21 @@ class MEGABYTE(nn.Module):
                 cache=cache,
                 use_kv_cache=False,
             )
-        if ids.numel() > 1 and tok_idx_in_seq == 0:
+
+        if run_prompt:
             # if we have multiple toks and it's the initial run, then we want
             # to process the whole prompt at once
-            return self.forward_inference(
+            return self.forward_inference_prompt(
                 ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
             )
 
+        tok_idx_in_seq = ids.numel()
         assert batch == 1, "currnelyt only batch size 1 supported"
         assert cache is not None
-        assert tok_idx_in_seq is not None
 
         embedded_tokens = self.embed_tokens(ids)
 
         period_0 = self.max_sequence_lengths[-1]
-        period_1 = 1
         if tok_idx_in_seq % period_0 == 0:
             dprint("RUNNING INFERENCE ON LAYER 0")
             stage_tokens = embedded_tokens[0]
@@ -1137,7 +1130,7 @@ class MEGABYTE(nn.Module):
                 cache=cache,
                 profile=profile,
                 run_full_sequence_attention=True,
-                encoder_hidden_states=encoder_hidden_states
+                encoder_hidden_states=encoder_hidden_states,
             )
 
         prev_stage_tokens_repr = get_cache(cache, "prev_stage_tokens_repr", init=False)
@@ -1334,53 +1327,29 @@ if __name__ == "__main__":
 
                     use_old_algo = True
                     print("GENRATING  NON MANUAL", tok_idx, time.time(), "\n")
-                    if not use_old_algo:
-                        # logits, cache2 = model.forward_inference(
-                        #     ids=x,
-                        #     use_cache=True,
-                        #     cache=cache2,
-                        #     profile=False,
-                        #     padded=False,
-                        #     tok_idx_in_seq=tok_idx,
-                        #     streaming=True,
-                        # )
-                        # # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-                        # inspect_shapes("LOGINTS", logits=logits)
-                        # logits = logits[:, -1]
-                        # logits = top_k(logits, thres=filter_thres)
-                        # sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
-                        # seq_len += 1
-                        # x = rearrange(sampled, "b -> b 1")
-                        # seq = torch.cat((seq, x), dim=-1)
-                        # x = seq
-                        pass
-                    else:
-                        print("x2.shape", x2.shape)
-                        logits = model.forward(ids=x2, use_cache=False, cache=None, profile=False)
-                        # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
-                        # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-                        logits = logits[:, -1]
-                        inspect_shapes("NON MANUAL LOGITS", print_values=True, logits=logits)
-                        non_manual_logits = logits
-                        logits = top_k(logits, thres=filter_thres)
-                        sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
-                        seq_len2 += 1
-                        x2 = rearrange(sampled, "b -> b 1")
-                        seq2 = torch.cat((seq2, x2), dim=-1)
-                        x2 = seq2
+                    logits = model.forward(ids=x2, use_cache=False, cache=None, profile=False)
+                    # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
+                    # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+                    logits = logits[:, -1]
+                    inspect_shapes("ORIGINAL ALGO", print_values=True, logits=logits)
+                    non_manual_logits = logits
+                    logits = top_k(logits, thres=filter_thres)
+                    sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+                    seq_len2 += 1
+                    x2 = rearrange(sampled, "b -> b 1")
+                    seq2 = torch.cat((seq2, x2), dim=-1)
+                    x2 = seq2
                 if True:
-                    print("\nGENERATING  MANUAL ", tok_idx, time.time(), "\n")
-                    logits, cache = model.forward_inference_manual(
+                    print("\nGENERATING  INFERENCE ", tok_idx, time.time(), "\n")
+                    logits, cache = model.forward_inference(
                         ids=x,
                         use_cache=True,
                         cache=cache,
                         profile=False,
-                        tok_idx_in_seq=tok_idx,
-                        streaming=True,
                     )
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                     logits = logits[:, -1]
-                    inspect_shapes("MANUAL LOGITS", print_values=True, logits=logits)
+                    inspect_shapes("INFERENCE LOGITS", print_values=True, logits=logits)
                     if torch.any(logits.round(decimals=3) != non_manual_logits.round(decimals=3)):  # type: ignore
                         assert False, "Results are not equal"
                     logits = top_k(logits, thres=filter_thres)
