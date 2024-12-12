@@ -22,9 +22,17 @@ import pprint
 
 # helpers
 
+DEBUG = True
+
+
+def dprint(*args, **kwargs):
+    if not DEBUG:
+        return
+    print(*args, **kwargs)
+
 
 def inspect_shapes(prefix, *, suppress=False, print_values=False, select=lambda x: x, **tensors):
-    if False:
+    if not DEBUG:
         return
     if suppress:
         return
@@ -275,7 +283,7 @@ class Attention(nn.Module):
                 k = torch.cat((k_cache, k), dim=2)
                 v = torch.cat((v_cache, v), dim=2)
             set_cache(cache, k=k, v=v)
-            print("kv cache: ", cache["v"].shape)
+            dprint("kv cache: ", cache["v"].shape)
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
 
@@ -283,7 +291,7 @@ class Attention(nn.Module):
         # print("v", v)
 
         out = self.attend(q, k, v)
-        inspect_shapes("attend direct out", print_values=True, out=out)
+        inspect_shapes("attend direct out", suppress=True, print_values=True, out=out)
 
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out), cache
@@ -405,7 +413,7 @@ class Transformer(nn.Module):
                 if cache is not None:
                     cache[layer_idx] = layer_cache
         inspect_shapes("transofrmer out pre norm", suppress=(not debug), print_values=True, x=x)
-        pre_norm_history = get_cache(cache, 'pre_norm', init=False)
+        pre_norm_history = get_cache(cache, "pre_norm", init=False)
         orig_shape = x.shape
         if pre_norm_history is not None:
             norm_in = torch.cat((pre_norm_history, x), dim=-2)
@@ -604,7 +612,7 @@ class MEGABYTE(nn.Module):
         cache: Optional[Dict] = None,
         profile: bool = False,
     ):
-        print("input ids: ", ids)
+        dprint("input ids: ", ids)
         batch = ids.shape[0]
         N = ids.shape[1]
 
@@ -709,7 +717,7 @@ class MEGABYTE(nn.Module):
                         cache["profile"][stage_idx].append(time.time() - start_time)
                     continue
                 else:
-                    print("NOT USING HS CACHE")
+                    dprint("NOT USING HS CACHE")
                 # if hs is not None:
 
             stage_tokens, ps = pack_one(stage_tokens, "* n d")
@@ -747,9 +755,7 @@ class MEGABYTE(nn.Module):
                     stage_tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
                 )
             else:
-                attended, stage_cache = transformer(
-                    stage_tokens, use_cache=use_cache, cache=stage_cache, debug=first_stage
-                )
+                attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache, debug=False)
             # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
             # print("before unpacking: ps: ", ps)
             attended = unpack_one(attended, ps, "* n d")
@@ -937,7 +943,7 @@ class MEGABYTE(nn.Module):
                 ),
                 dim=-2,
             )
-            print("stage_tokens", stage_tokens)
+            dprint("stage_tokens", stage_tokens)
 
             # sum the previous hierarchy's representation
             if exists(prev_stage_tokens_repr):
@@ -1084,7 +1090,7 @@ class MEGABYTE(nn.Module):
         tok_idx_in_seq=None,
         streaming=True,
     ):
-        print("input ids: ", ids)
+        dprint("input ids: ", ids)
         batch = ids.shape[0]
         seq_len = ids.shape[-1]
 
@@ -1134,9 +1140,8 @@ class MEGABYTE(nn.Module):
 
         period_0 = self.max_sequence_lengths[-1]
         period_1 = 1
-
         if tok_idx_in_seq % period_0 == 0:
-            print("RUNNING INFERENCE ON LAYER 0")
+            dprint("RUNNING INFERENCE ON LAYER 0")
             stage_tokens = embedded_tokens[0]
             _, cache = self.forward_stage(
                 0,
@@ -1145,16 +1150,20 @@ class MEGABYTE(nn.Module):
                 cache=cache,
                 profile=profile,
             )
+        
+        prev_stage_tokens_repr = get_cache(cache, 'prev_stage_tokens_repr', init=False)
+        if prev_stage_tokens_repr is None:
+            prev_stage_tokens_repr = cache["hidden_states"][0]
 
-        prev_stage_tokens_repr = cache["hidden_states"][0]
-
-        print("RUNNING INFERENCE ON LAYER 1")
+        dprint("RUNNING INFERENCE ON LAYER 1")
         stage_tokens = embedded_tokens[1]
         # these will contain the whole sequence windowed into B, N, n, D where n is the stage context size and N is the number of
         # windows of size n the sequence is splitted in.
         # During token-by-token inference we are only interested in the newest window
         stage_tokens = stage_tokens[:, -1, :, :]
         attended, cache = self.forward_stage(1, stage_tokens, prev_stage_tokens_repr=prev_stage_tokens_repr, profile=profile, cache=cache)  # type: ignore[]
+
+        set_cache(cache, 'prev_stage_tokens_repr', cache["hidden_states"][0])
 
         logits = self.to_logits(attended)
         logits = logits[..., 1:, :]
@@ -1204,7 +1213,7 @@ class MEGABYTE(nn.Module):
         # The active token is the one we want to process, i.e. the last incoming token
         # that we want to attend to. Earlier token attention kv's will come from cache
         active_token_idx = tok_idx_in_seq % context_size
-        print(f"stage {stage_idx} context size: {context_size}, active token: {active_token_idx}")
+        dprint(f"stage {stage_idx} context size: {context_size}, active token: {active_token_idx}")
         # TODO HIER WEITER:
         # das problem ist, dass in der original implementation immer das stage_token des letzten paketes
         # verwendet wird, da der letzte wert discarded wird. das istdenke ich laut paper nicht korrekt,
@@ -1253,7 +1262,12 @@ class MEGABYTE(nn.Module):
             # select only the most recent token (the other ones are padding)
             # keeping the dims
             select_idx = active_token_idx if stage_idx != 0 else -1
-            inspect_shapes(f"selecting active token index {select_idx}", print_values=True, stage_tokens=stage_tokens)
+            inspect_shapes(
+                f"selecting active token index {select_idx}",
+                suppress=True,
+                print_values=True,
+                stage_tokens=stage_tokens,
+            )
             new_tokens = stage_tokens[..., [select_idx], :]
 
         if stage_idx == 0:
@@ -1274,18 +1288,23 @@ class MEGABYTE(nn.Module):
                 use_cache=use_cache,
                 cache=kv_cache,
                 bypass_token_shift=bypass_token_shift,
-                debug=stage_idx == 0,
+                debug=False,
             )
         # project for next stage in the hierarchy
 
         proj = self.to_next_transformer_projections[stage_idx]
+        to_test = attended
+        # to_next_layer = attended[..., -1, :]  # if attended.shape[-2] > 1 else attended
+        test_out = proj(to_test)
+        inspect_shapes("proj test", test_out=test_out, print_values=stage_idx == 0)
         to_next_layer = attended[..., :-1, :] if attended.shape[-2] > 1 else attended
+        to_next_layer = attended[..., -1, :]  # if attended.shape[-2] > 1 else attended
         prev_stage_tokens_repr = proj(to_next_layer)
 
         # update cache
         # inspect_shapes(f"output cache {stage_idx}", v=kv_cache[0]["v"])
         cache["kv"][stage_idx] = kv_cache  # type: ignore
-        if stage_idx < self.depth - 1:
+        if cache is not None and stage_idx < self.depth - 1:
             # inspect_shapes(
             #     "updating hs cache",
             #     print_values=True,
@@ -1346,7 +1365,7 @@ if __name__ == "__main__":
             x2 = prime
             manual = False
             use_same_sequence_for_both = True
-            N = 7 - prime.numel()
+            N = 9 - prime.numel()
             for tok_idx in range(N):
                 tok_idx += prime.numel()
                 non_manual_logits = None
@@ -1380,9 +1399,9 @@ if __name__ == "__main__":
                         logits = model.forward(ids=x2, use_cache=False, cache=None, profile=False)
                         # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
                         # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
+                        inspect_shapes("NON MANUAL LOGITS", print_values=True, logits=logits)
                         logits = logits[:, -1]
                         non_manual_logits = logits
-                        inspect_shapes("NON MANUAL LOGITS", print_values=True, logits=logits)
                         logits = top_k(logits, thres=filter_thres)
                         sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
                         seq_len2 += 1
@@ -1401,8 +1420,8 @@ if __name__ == "__main__":
                         streaming=True,
                     )
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-                    logits = logits[:, -1]
                     inspect_shapes("MANUAL LOGITS", print_values=True, logits=logits)
+                    logits = logits[:, -1]
                     if torch.any(logits.round(decimals=3) != non_manual_logits.round(decimals=3)):  # type: ignore
                         assert False, "Results are not equal"
                     logits = top_k(logits, thres=filter_thres)
