@@ -22,7 +22,7 @@ import pprint
 
 # helpers
 
-DEBUG = True
+DEBUG = False
 
 
 def dprint(*args, **kwargs):
@@ -354,9 +354,7 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(dim)
         self.has_cross_attention = has_cross_attention
 
-    def forward(
-        self, x, encoder_hidden_states=None, use_cache=False, cache=None, bypass_token_shift=False, debug=False
-    ):
+    def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None, debug=False):
         inspect_shapes("Transformer", suppress=(not debug), print_values=True, x=x)
         n = x.shape[-2]
         rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None  # type: ignore
@@ -1150,8 +1148,8 @@ class MEGABYTE(nn.Module):
                 cache=cache,
                 profile=profile,
             )
-        
-        prev_stage_tokens_repr = get_cache(cache, 'prev_stage_tokens_repr', init=False)
+
+        prev_stage_tokens_repr = get_cache(cache, "prev_stage_tokens_repr", init=False)
         if prev_stage_tokens_repr is None:
             prev_stage_tokens_repr = cache["hidden_states"][0]
 
@@ -1163,16 +1161,18 @@ class MEGABYTE(nn.Module):
         stage_tokens = stage_tokens[:, -1, :, :]
         attended, cache = self.forward_stage(1, stage_tokens, prev_stage_tokens_repr=prev_stage_tokens_repr, profile=profile, cache=cache)  # type: ignore[]
 
-        set_cache(cache, 'prev_stage_tokens_repr', cache["hidden_states"][0])
+        set_cache(cache, "prev_stage_tokens_repr", cache["hidden_states"][0])
 
         logits = self.to_logits(attended)
-        logits = logits[..., 1:, :]
 
+        logits_idx = ((tok_idx_in_seq - 1) % self.max_sequence_lengths[-1]) + 1
+        inspect_shapes("output raw", print_values=True, logits=logits.round(decimals=2), attended=attended)
+        logits = logits[..., logits_idx : logits_idx + 1, :]
         if flattened_dims:
             logits = rearrange(logits, "b ... c -> b (...) c")
             logits = logits[:, :seq_len]
-
         inspect_shapes("output", logits=logits.round(decimals=2))
+
         return logits, cache
 
     def forward_stage(
@@ -1272,7 +1272,7 @@ class MEGABYTE(nn.Module):
 
         if stage_idx == 0:
             pass
-        bypass_token_shift = tok_idx_in_seq % context_size != 0
+        # bypass_token_shift = tok_idx_in_seq % context_size != 0
         transformer = self.transformers[stage_idx]
         if stage_idx == 0 and self.add_cross_attention:
             attended, kv_cache = transformer(
@@ -1280,24 +1280,18 @@ class MEGABYTE(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 use_cache=use_cache,
                 cache=kv_cache,
-                bypass_token_shift=bypass_token_shift,
             )
         else:
             attended, kv_cache = transformer(
                 new_tokens,
                 use_cache=use_cache,
                 cache=kv_cache,
-                bypass_token_shift=bypass_token_shift,
                 debug=False,
             )
         # project for next stage in the hierarchy
 
         proj = self.to_next_transformer_projections[stage_idx]
-        to_test = attended
-        # to_next_layer = attended[..., -1, :]  # if attended.shape[-2] > 1 else attended
-        test_out = proj(to_test)
-        inspect_shapes("proj test", test_out=test_out, print_values=stage_idx == 0)
-        to_next_layer = attended[..., :-1, :] if attended.shape[-2] > 1 else attended
+        # to_next_layer = attended[..., :-1, :] if attended.shape[-2] > 1 else attended
         to_next_layer = attended[..., -1, :]  # if attended.shape[-2] > 1 else attended
         prev_stage_tokens_repr = proj(to_next_layer)
 
@@ -1315,6 +1309,7 @@ class MEGABYTE(nn.Module):
         if profile:
             cache["profile"][stage_idx].append(time.time() - start_time)  # type: ignore
 
+        # attended = attended[:, active_token_idx : active_token_idx + 1, :]
         return attended, cache
 
 
@@ -1365,7 +1360,7 @@ if __name__ == "__main__":
             x2 = prime
             manual = False
             use_same_sequence_for_both = True
-            N = 9 - prime.numel()
+            N = 32 - prime.numel()
             for tok_idx in range(N):
                 tok_idx += prime.numel()
                 non_manual_logits = None
@@ -1399,8 +1394,8 @@ if __name__ == "__main__":
                         logits = model.forward(ids=x2, use_cache=False, cache=None, profile=False)
                         # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
                         # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-                        inspect_shapes("NON MANUAL LOGITS", print_values=True, logits=logits)
                         logits = logits[:, -1]
+                        inspect_shapes("NON MANUAL LOGITS", print_values=True, logits=logits)
                         non_manual_logits = logits
                         logits = top_k(logits, thres=filter_thres)
                         sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
@@ -1420,8 +1415,8 @@ if __name__ == "__main__":
                         streaming=True,
                     )
                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-                    inspect_shapes("MANUAL LOGITS", print_values=True, logits=logits)
                     logits = logits[:, -1]
+                    inspect_shapes("MANUAL LOGITS", print_values=True, logits=logits)
                     if torch.any(logits.round(decimals=3) != non_manual_logits.round(decimals=3)):  # type: ignore
                         assert False, "Results are not equal"
                     logits = top_k(logits, thres=filter_thres)
