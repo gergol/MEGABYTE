@@ -105,15 +105,37 @@ def top_k(logits, thres=0.5):
 # token shift, from Peng et al of RWKV
 
 
-def token_shift(t, bypass=False):
-    # inspect_shapes("TOKENSHIFR INPUT", t=t)
-    if bypass:
-        return t
+# def token_shift(t, bypass=False, use_cache=False, cache=None):
+#     inspect_shapes("TOKENSHIFR INPUT", t=t)
+#     if bypass:
+#         return t
+#     t, t_shift = t.chunk(2, dim=-1)
+#     t_shift = F.pad(t_shift, (0, 0, 1, -1))
+#     result = torch.cat((t, t_shift), dim=-1)
+#     # print(result)
+#     if use_cache:
+#         return result, None
+#     return result
+
+
+def token_shift(t, use_cache=False, cache=None):
+    if not use_cache:
+        t, t_shift = t.chunk(2, dim=-1)
+        t_shift = F.pad(t_shift, (0, 0, 1, -1))
+        return torch.cat((t, t_shift), dim=-1)
+
+    # TODO: the current cache implementation only saves the
+    # data of the previous invocation, however in order to fully
+    # restore the state at any past time we would need to store the
+    # full history. Maybe we want to reconsider this at a later point.
     t, t_shift = t.chunk(2, dim=-1)
-    t_shift = F.pad(t_shift, (0, 0, 1, -1))
-    result = torch.cat((t, t_shift), dim=-1)
-    # print(result)
-    return result
+    if cache is None:
+        cache = t_shift[:, -1:, :].clone()
+        t_shift = F.pad(t_shift, (0, 0, 1, -1))
+    else:
+        t_shift, cache = torch.cat((cache, t_shift[:, :-1, :]), dim=-2), t_shift[:, -1:, :].clone()
+    ret = torch.cat((t, t_shift), dim=-1)
+    return ret, cache
 
 
 # rotary positional embedding
@@ -143,6 +165,28 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(pos, t):
     return t * pos.cos() + rotate_half(t) * pos.sin()
+
+
+def get_cache(cache: Optional[Dict], key: Union[int, str], init=False):
+    if cache is None:
+        return None
+    if key not in cache:
+        if not init:
+            return None
+        cache[key] = {}
+    return cache[key]
+
+
+def set_cache(
+    cache: Optional[Dict], key: Optional[Union[int, str]] = None, value: Optional[torch.Tensor] = None, **entries
+):
+    if isinstance(cache, dict):
+        if key is not None:
+            assert value is not None
+            cache[key] = value.clone()
+        for k, v in entries.items():
+            cache[k] = v.clone()
+    return cache
 
 
 # norm
@@ -188,8 +232,17 @@ class Attention(nn.Module):
     def forward(self, x, rotary_emb=None, encoder_hidden_states=None, use_cache=False, cache=None):
         assert self.is_cross_attention == (encoder_hidden_states is not None)
         h = self.heads
-        x = self.norm(x)
-        # inspect_shapes("Attend input", x=x)
+        if use_cache and cache is not None:
+            if "input" in cache:
+                input = torch.cat((cache["input"], x), dim=-2)
+                cache["input"] = input
+            else:
+                cache["input"] = x.clone()
+                input = x
+        else:
+            input = x
+        x = self.norm(input)
+        inspect_shapes("Attend input", print_values=True, post_norm=x, pre_norm=input)
         # print("ATTEND INPUT \n", x, "\nEND")
         if self.is_cross_attention:
             q, k, v = (self.to_q(x), *self.to_kv(encoder_hidden_states).chunk(2, dim=-1))
@@ -197,18 +250,31 @@ class Attention(nn.Module):
             q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim=-1))
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
+        # if use_cache:
+        #     if cache is not None:
+        #         # print("READING FROM CHACHE")
+        #         in_cache = cache.get("input")
+        #         k_cache = cache.get("k")
+        #         v_cache = cache.get("v")
+        #         if k_cache is not None and v_cache is not None and in_cache is not None:
+        #             input = in_cache.cat((in_cache, input), dim=2)
+        #             k = torch.cat((k_cache, k), dim=2)
+        #             v = torch.cat((v_cache, v), dim=2)
+        #         cache["input"] = input.clone()
+        #         cache["k"] = k.clone()
+        #         cache["v"] = v.clone()
+        #     else:
+        #         cache = {"input": input.clone(), "k": k.clone(), "v": v.clone()}
         if use_cache:
-            if cache is not None:
-                # print("READING FROM CHACHE")
-                k_cache = cache.get("k")
-                v_cache = cache.get("v")
-                if k_cache is not None and v_cache is not None:
-                    k = torch.cat((k_cache, k), dim=2)
-                    v = torch.cat((v_cache, v), dim=2)
-                cache["k"] = k.clone()
-                cache["v"] = v.clone()
-            else:
-                cache = {"k": k.clone(), "v": v.clone()}
+            assert cache is not None, "You must provide an empty dict as cache for the inital run"
+            in_cache = get_cache(cache, "input")
+            k_cache = get_cache(cache, "k")
+            v_cache = get_cache(cache, "v")
+            if k_cache is not None and v_cache is not None and in_cache is not None:
+                input = torch.cat((in_cache, input), dim=2)
+                k = torch.cat((k_cache, k), dim=2)
+                v = torch.cat((v_cache, v), dim=2)
+            set_cache(cache, input=input, k=k, v=v)
             print("kv cache: ", cache["v"].shape)
         if exists(rotary_emb):
             q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
@@ -279,22 +345,28 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(dim)
         self.has_cross_attention = has_cross_attention
 
-    def forward(self, x, encoder_hidden_states=None, use_cache=False, cache=None, bypass_token_shift=False, debug=False):
+    def forward(
+        self, x, encoder_hidden_states=None, use_cache=False, cache=None, bypass_token_shift=False, debug=False
+    ):
         inspect_shapes("Transformer", suppress=(not debug), print_values=True, x=x)
         n = x.shape[-2]
         rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None  # type: ignore
 
         if use_cache and cache is None:
-            cache = [None] * len(self.layers)
+            # cache = [{}] * len(self.layers)
+            cache = {}
         if self.has_cross_attention:
 
             for layer_idx, (attn, ff, cross_attn) in enumerate(self.layers):  # type: ignore
                 if self.use_old_layout:
                     cross_attn, ff = ff, cross_attn  # swap the variable names to match the old layout if needed
 
-                layer_cache = cache[layer_idx] if cache is not None else None
+                # layer_cache = cache[layer_idx] if cache is not None else None
+                layer_cache = get_cache(cache, layer_idx, init=True)
+                shifted, cache0 = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_0"))
+                set_cache(layer_cache, "tok_shift_0", cache0)
                 attended, layer_cache = attn(
-                    token_shift(x, bypass=bypass_token_shift),
+                    shifted,
                     rotary_emb=rotary_emb,
                     use_cache=use_cache,
                     cache=layer_cache,
@@ -302,27 +374,29 @@ class Transformer(nn.Module):
                 x = attended + x
                 x = (
                     cross_attn(
-                        token_shift(x, bypass=bypass_token_shift),
+                        token_shift(x),
                         rotary_emb=rotary_emb,
                         encoder_hidden_states=encoder_hidden_states,
                     )[0]
                     + x
                 )
-                x = ff(token_shift(x, bypass=bypass_token_shift)) + x
+                x = ff(token_shift(x)) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
         else:
             for layer_idx, (attn, ff) in enumerate(self.layers):  # type: ignore
-                layer_cache = cache[layer_idx] if cache is not None else None
+                layer_cache = get_cache(cache, layer_idx, init=True)
+                shifted, cache0 = token_shift(x, use_cache=True, cache=get_cache(layer_cache, "tok_shift_0"))
+                set_cache(layer_cache, "tok_shift_0", cache0)
                 attended, layer_cache = attn(
-                    token_shift(x, bypass=bypass_token_shift),
+                    shifted,
                     rotary_emb=rotary_emb,
                     use_cache=use_cache,
                     cache=layer_cache,
                     # x, rotary_emb=rotary_emb, use_cache=use_cache, cache=layer_cache
                 )
                 x = attended + x
-                x = ff(token_shift(x, bypass=bypass_token_shift)) + x
+                x = ff(token_shift(x)) + x
                 if cache is not None:
                     cache[layer_idx] = layer_cache
         inspect_shapes("transofrmer out pre norm", suppress=(not debug), print_values=True, x=x)
@@ -485,6 +559,7 @@ class MEGABYTE(nn.Module):
                 tokens = tokens + prev_stage_tokens_repr[..., : tokens.shape[-2], :]
 
             stage_cache = cache["kv"][stage_idx] if cache else None
+            inspect_shapes(f"forward_empty TF input stage {stage_idx}", print_values=True, tokens=tokens)
             if is_first_stage:
                 tokens, stage_cache = transformer(
                     tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
@@ -517,6 +592,7 @@ class MEGABYTE(nn.Module):
         batch = ids.shape[0]
         N = ids.shape[1]
 
+        assert use_cache or cache is None, "You must not provide a cache when use_cache=False"
         # print("\n\nCALLING MEGABYTE FORWARD", ids.shape)
         # inspect_shapes("MEGABYTE", ids=ids)
         assert ids.ndim in {2, self.stages + 1}
@@ -655,7 +731,9 @@ class MEGABYTE(nn.Module):
                     stage_tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
                 )
             else:
-                attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache, debug=first_stage)
+                attended, stage_cache = transformer(
+                    stage_tokens, use_cache=use_cache, cache=stage_cache, debug=first_stage
+                )
             # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
             # print("before unpacking: ps: ", ps)
             attended = unpack_one(attended, ps, "* n d")
@@ -728,6 +806,7 @@ class MEGABYTE(nn.Module):
         batch = ids.shape[0]
         N = ids.shape[1]
 
+        assert use_cache or cache is None, "You must not provide a cache when use_cache=False"
         # print("\n\nCALLING MEGABYTE FORWARD", ids.shape)
         # inspect_shapes("MEGABYTE", ids=ids)
         assert ids.ndim in {2, self.stages + 1}
@@ -1005,6 +1084,7 @@ class MEGABYTE(nn.Module):
             not use_cache or len(ids.shape) == 2 and batch == 1
         ), "caching is curently only supported for batch size == 1"
         assert self.pos_embs is None, "not yet implemented for models with positional embeddings"
+        assert use_cache or cache is None, "You must not provide a cache when use_cache=False"
 
         flattened_dims = ids.ndim == 2
 
@@ -1109,6 +1189,15 @@ class MEGABYTE(nn.Module):
         # that we want to attend to. Earlier token attention kv's will come from cache
         active_token_idx = tok_idx_in_seq % context_size
         print(f"stage {stage_idx} context size: {context_size}, active token: {active_token_idx}")
+        # TODO HIER WEITER:
+        # das problem ist, dass in der original implementation immer das stage_token des letzten paketes
+        # verwendet wird, da der letzte wert discarded wird. das istdenke ich laut paper nicht korrekt,
+        # aber ich muss es so modellieren, da sonst nur crap rauskommt.
+        # d.h. in ganz am beginn in stage 0 muss ich nur das start token in den transformer jagen,
+        # danach dann immer den neuen state zu n -1 generieren, i.e. beim index 3, 7, 11, usw.
+        # wahrscheinlcih kann ich einfach nur einen inital run ausserhalb des loops machen, und dann
+        # die stage 0 NACH der stage 1 zu den entsprechenden indices aufrufen...
+
         if active_token_idx == 0:
             # if we start a new context window, we need to prepend the start tokens
             stage_start_tokens = self.start_tokens[stage_idx]
@@ -1165,7 +1254,11 @@ class MEGABYTE(nn.Module):
             )
         else:
             attended, kv_cache = transformer(
-                new_tokens, use_cache=use_cache, cache=kv_cache, bypass_token_shift=bypass_token_shift, debug=stage_idx == 0
+                new_tokens,
+                use_cache=use_cache,
+                cache=kv_cache,
+                bypass_token_shift=bypass_token_shift,
+                debug=stage_idx == 0,
             )
         # project for next stage in the hierarchy
 
@@ -1237,7 +1330,9 @@ if __name__ == "__main__":
             x2 = prime
             manual = False
             use_same_sequence_for_both = True
-            for tok_idx in range(12):
+            N = 7 - prime.numel()
+            for tok_idx in range(N):
+                tok_idx += prime.numel()
                 non_manual_logits = None
                 print("\n", "*" * 90)
                 if True:
@@ -1266,7 +1361,7 @@ if __name__ == "__main__":
                         pass
                     else:
                         print("x2.shape", x2.shape)
-                        logits = model.forward(ids=x2, use_cache=False, cache=cache, profile=False)
+                        logits = model.forward(ids=x2, use_cache=False, cache=None, profile=False)
                         # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
                         # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
                         logits = logits[:, -1]
@@ -1310,7 +1405,8 @@ if __name__ == "__main__":
             print("Manual seq    :", seq)
             return seq.reshape(batch, seq_len).flatten(-1), cache
 
-    prime = torch.zeros((1, 1), dtype=torch.long, device="cuda")
+    # prime = torch.zeros((1, 1), dtype=torch.long, device="cuda")
+    prime = None
     model = MEGABYTE(
         vocab_size=6,
         hidden_sizes=(3, 2),
@@ -1324,92 +1420,3 @@ if __name__ == "__main__":
     model.eval()
     Y, cache = generate_few(model, prime=prime, temperature=0.5, default_batch_size=1)
     print(Y)
-
-    # def generate_few_old(
-    #     model,
-    #     prime=None,
-    #     filter_thres=0.9,
-    #     temperature=1.0,
-    #     default_batch_size=1,
-    # ):
-    #
-    #     model.eval()
-    #
-    #     start_time = time.time()
-    #
-    #     with torch.inference_mode():
-    #
-    #         # total_seq_len = reduce_mult(model.max_sequence_lengths)
-    #         device = "cuda"
-    #         # print(device)
-    #
-    #         if not exists(prime):
-    #             prime = torch.empty((default_batch_size, 0), dtype=torch.long, device=device)
-    #         prime = prime.to(device)
-    #
-    #         seq = prime
-    #         batch = seq.shape[0]
-    #
-    #         seq_len = seq.shape[-1]
-    #         # cache = {'profile': [[], []], 'hidden_states': [None, None], 'kv': [[],[]]}
-    #         cache = None
-    #         x = prime
-    #         manual = False
-    #         if manual:
-    #             for tok_idx in range(32):
-    #                 print("\nGENERATING ", tok_idx, time.time(), "\n")
-    #                 logits, cache = model.forward_inference_manual(
-    #                     ids=x,
-    #                     use_cache=True,
-    #                     cache=cache,
-    #                     profile=False,
-    #                     padded=False,
-    #                     tok_idx_in_seq=tok_idx,
-    #                     streaming=True,
-    #                 )
-    #                 # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-    #                 logits = logits[:, -1]
-    #                 logits = top_k(logits, thres=filter_thres)
-    #                 sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
-    #                 seq_len += 1
-    #                 x = rearrange(sampled, "b -> b 1")
-    #                 seq = torch.cat((seq, x), dim=-1)
-    #
-    #         else:
-    #
-    #             use_old_algo = True
-    #             for tok_idx in range(32):
-    #                 print("\nGENERATING ", tok_idx, time.time(), "\n")
-    #                 if not use_old_algo:
-    #                     logits, cache = model.forward_inference(
-    #                         ids=x,
-    #                         use_cache=True,
-    #                         cache=cache,
-    #                         profile=False,
-    #                         padded=False,
-    #                         tok_idx_in_seq=tok_idx,
-    #                         streaming=True,
-    #                     )
-    #                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-    #                     inspect_shapes("LOGINTS", logits=logits)
-    #                     logits = logits[:, -1]
-    #                     logits = top_k(logits, thres=filter_thres)
-    #                     sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
-    #                     seq_len += 1
-    #                     x = rearrange(sampled, "b -> b 1")
-    #                     seq = torch.cat((seq, x), dim=-1)
-    #                     # x = seq
-    #                 else:
-    #                     logits = model.forward(ids=x, use_cache=False, cache=cache, profile=False)
-    #                     # logits, cache = model.forward_old(ids=x, use_cache=True, cache=cache, profile=False)
-    #                     # inspect_shapes("CACHE_RESULT", cache=cache['hidden_states'][0])
-    #                     logits = logits[:, -1]
-    #                     logits = top_k(logits, thres=filter_thres)
-    #                     sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
-    #                     seq_len += 1
-    #                     x = rearrange(sampled, "b -> b 1")
-    #                     seq = torch.cat((seq, x), dim=-1)
-    #                     x = seq
-    #         dur = time.time() - start_time
-    #         print(f"Generated {seq_len} tokens in {dur:.2f} seconds ({seq_len/dur:.1f} tokens/s)")
-    #         return seq.reshape(batch, seq_len).flatten(-1), cache
