@@ -1056,7 +1056,7 @@ class MEGABYTE(nn.Module):
                 assert self.depth == 2, "Currently only two-stage models are supported"
                 last_frame_is_incomplete = seq_len % self.max_sequence_lengths[-1] != 0  # type: ignore
                 if last_frame_is_incomplete and stage_idx == 0:
-                    print("last frame is incomplete")
+                    # print("last frame is incomplete")
                     # cut the incomplete final patch out for the first layer
                     stage_ids = stage_ids[:, :-1, :]
                 if stage_idx != 0:
