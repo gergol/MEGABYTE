@@ -22,7 +22,7 @@ import pprint
 
 # helpers
 
-DEBUG = True
+DEBUG = False
 
 
 def dprint(*args, **kwargs):
@@ -1089,21 +1089,23 @@ class MEGABYTE(nn.Module):
         cache: Optional[Dict] = None,
         profile: bool = False,
     ):
+        dprint("input ids: ", ids)
+        batch = ids.shape[0]
+        seq_len = ids.shape[-1]
 
-
-        logits, cache = self.forward_inference_impl(
-            ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile
+        run_prompt = seq_len > 0 and cache is None
+        logits, cache = self._forward_inference_impl(
+            ids=ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile
         )
+        if run_prompt and seq_len % self.max_sequence_lengths[-1] == 0:
 
-        run_prompt = ids.shape[-1] > 0 and cache is None
-        needs_extra_run_for_cache_initialization = run_prompt and ids.shape[-1] % self.max_sequence_lengths[-1] == 0
-        if needs_extra_run_for_cache_initialization:
-            logits, cache = self.forward_inference_impl(
-                ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile
+            logits, cache = self._forward_inference_impl(
+                ids=ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile
             )
+
         return logits, cache
 
-    def forward_inference_impl(
+    def _forward_inference_impl(
         self,
         ids,
         encoder_hidden_states=None,
@@ -1131,9 +1133,8 @@ class MEGABYTE(nn.Module):
 
         flattened_dims = ids.ndim == 2
 
-        run_prompt = ids.numel() > 0 and cache is None
-        if run_prompt:
-            print("IT's A PROMPT")
+        run_prompt = seq_len > 0 and cache is None
+
         if use_cache and cache is None:
             cache = {}
             cache["kv"] = [None] * self.depth
@@ -1150,14 +1151,7 @@ class MEGABYTE(nn.Module):
                 use_kv_cache=False,
             )
 
-        # if run_prompt:
-        #     # if we have multiple toks and it's the initial run, then we want
-        #     # to process the whole prompt at once
-        #     return self.forward_inference_prompt(
-        #         ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
-        #     )
-
-        tok_idx_in_seq = ids.numel()
+        tok_idx_in_seq = seq_len
         assert batch == 1, "currnelyt only batch size 1 supported"
         assert cache is not None
 
@@ -1177,7 +1171,7 @@ class MEGABYTE(nn.Module):
                 profile=profile,
                 run_full_sequence_attention=True,
                 encoder_hidden_states=encoder_hidden_states,
-                prompt=run_prompt,
+                is_complete_window_prompt_on_stage0=run_prompt and seq_len % self.max_sequence_lengths[-1] == 0,
             )
 
         prev_stage_tokens_repr = get_cache(cache, "prev_stage_tokens_repr", init=False)
@@ -1216,7 +1210,7 @@ class MEGABYTE(nn.Module):
         prev_stage_tokens_repr=None,
         profile=False,
         run_full_sequence_attention=False,
-        prompt=False,
+        is_complete_window_prompt_on_stage0=False,
     ):
         assert cache is not None
         use_cache = not run_full_sequence_attention
@@ -1298,8 +1292,8 @@ class MEGABYTE(nn.Module):
         proj = self.to_next_transformer_projections[stage_idx]
         # to_next_layer = attended[..., :-1, :] if attended.shape[-2] > 1 else attended
         to_next_layer = attended[..., -1, :]  # if attended.shape[-2] > 1 else attended
-        if prompt and stage_idx == 0:
-            to_next_layer = attended[..., -2, :]
+        if is_complete_window_prompt_on_stage0:
+            to_next_layer = attended[..., -2, :]  # if attended.shape[-2] > 1 else attended
         inspect_shapes("to_next_layer_proj", print_values=True, to_next_layer=to_next_layer)
         prev_stage_tokens_repr = proj(to_next_layer)
 
@@ -1330,7 +1324,7 @@ if __name__ == "__main__":
     import lightning as L
 
     # L.seed_everything(43894)
-    L.seed_everything(43896)
+    L.seed_everything(43895)
 
     def generate_few(
         model,
@@ -1369,7 +1363,7 @@ if __name__ == "__main__":
             x2 = prime
             manual = False
             use_same_sequence_for_both = True
-            N = 7 - prime.numel()
+            N = 32 - prime.numel()
             for tok_idx in range(N):
                 tok_idx += prime.numel()
                 non_manual_logits = None
@@ -1402,7 +1396,7 @@ if __name__ == "__main__":
                     logits = logits[:, -1]
                     inspect_shapes("INFERENCE LOGITS", print_values=True, logits=logits)
                     if torch.any(logits.round(decimals=3) != non_manual_logits.round(decimals=3)):  # type: ignore
-                        assert True, "Results are not equal"
+                        assert False, "Results are not equal"
                     logits = top_k(logits, thres=filter_thres)
                     sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
                     seq_len += 1
@@ -1419,9 +1413,9 @@ if __name__ == "__main__":
             print("Manual seq    :", seq)
             return seq.reshape(batch, seq_len).flatten(-1), cache
 
-    # prime = None
+    prime = None
     # prime = torch.ones((1, 4), dtype=torch.long, device="cuda")
-    prime = (torch.arange(5, dtype=torch.long, device="cuda").unsqueeze(0)) % 5 + 1
+    # prime = (torch.arange(4, dtype=torch.long, device="cuda").unsqueeze(0)) % 5 + 1
     model = MEGABYTE(
         vocab_size=6,
         hidden_sizes=(3, 2),
