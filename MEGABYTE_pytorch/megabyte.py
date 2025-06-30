@@ -1,24 +1,20 @@
-import math
 import functools
+import math
+import pprint
+import time
+from collections.abc import Callable
 from itertools import zip_longest
 
-import time
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
-
-from einops import rearrange, reduce, repeat, pack, unpack
-from einops.layers.torch import Rearrange
-
 from beartype import beartype
-from beartype.typing import Tuple, Union, List, Optional, Dict
-from collections.abc import Callable
+from beartype.typing import Dict, List, Optional, Tuple, Union
+from einops import pack, rearrange, reduce, repeat, unpack
+from einops.layers.torch import Rearrange
+from torch import einsum, nn
+from tqdm import tqdm
 
 from MEGABYTE_pytorch.attend import Attend
-
-
-from tqdm import tqdm
-import pprint
 
 # helpers
 
@@ -1125,9 +1121,9 @@ class MEGABYTE(nn.Module):
         ), "encoder_hidden_states are expected if and only if self.add_cross_attention == True"
 
         assert not use_cache or self.depth == 2, "cache is only implemented for two-layer MEGABYTE models"
-        assert (
-            not use_cache or len(ids.shape) == 2 and batch == 1
-        ), "caching is curently only supported for batch size == 1"
+        # assert (
+        #     not use_cache or len(ids.shape) == 2 and batch == 1
+        # ), "caching is curently only supported for batch size == 1"
         assert self.pos_embs is None, "not yet implemented for models with positional embeddings"
         assert use_cache or cache is None, "You must not provide a cache when use_cache=False"
 
@@ -1152,7 +1148,7 @@ class MEGABYTE(nn.Module):
             )
 
         tok_idx_in_seq = seq_len
-        assert batch == 1, "currnelyt only batch size 1 supported"
+        # assert batch == 1, "currnelyt only batch size 1 supported"
         assert cache is not None
 
         embedded_tokens = self.embed_tokens(ids, prompt=run_prompt)
@@ -1214,7 +1210,7 @@ class MEGABYTE(nn.Module):
     ):
         assert cache is not None
         use_cache = not run_full_sequence_attention
-        assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
+        # assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
         assert stage_tokens.ndim == 3
         if profile:
             start_time = time.time()
@@ -1257,7 +1253,7 @@ class MEGABYTE(nn.Module):
             prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
             stage_tokens = stage_tokens + prev_stage_tokens_repr
 
-        assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
+        # assert stage_tokens.shape[0] == 1, "we shuld only have batch size 1 here"
 
         if active_token_idx == 0 or run_full_sequence_attention:
             new_tokens = stage_tokens
