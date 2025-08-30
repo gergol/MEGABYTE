@@ -8,7 +8,7 @@ from itertools import zip_longest
 import torch
 import torch.nn.functional as F
 from beartype import beartype
-from beartype.typing import Dict, List, Optional, Tuple, Union
+from beartype.typing import Dict, List, Optional, Set, Tuple, Union
 from einops import pack, rearrange, reduce, repeat, unpack
 from einops.layers.torch import Rearrange
 from torch import einsum, nn
@@ -403,7 +403,7 @@ class Transformer(nn.Module):
 
 # main class
 
-class MEGABYTE_MultiHead(nn.Module):
+class MEGABYTE(nn.Module):
 
     def __init__(
         self,
@@ -531,6 +531,11 @@ class MEGABYTE_MultiHead(nn.Module):
                 nn.ReLU(),
                 nn.Linear(fine_dim // 4, 2)  # Binary: music vs text
             )
+
+            if text_token_ids:
+                self.text_token_ids_tensor = torch.tensor(list(text_token_ids), dtype=torch.long)
+            else:
+                self.text_token_ids_tensor = torch.tensor([], dtype=torch.long)
         else:
             # Original single head
             self.to_logits = nn.Linear(fine_dim, vocab_size)
@@ -543,76 +548,108 @@ class MEGABYTE_MultiHead(nn.Module):
         Convert hidden states to logits, with optional routing for text tokens.
         
         Args:
-            hidden_states: Tensor of shape (batch, seq_len, hidden_dim)
+            hidden_states: Tensor of shape (batch, N, n, hidden_dim) where:
+                          N is number of windows, n is stage context size (includes start token)
             target_ids: Optional tensor of target token IDs for oracle routing during training
         
         Returns:
-            logits: Tensor of shape (batch, seq_len, vocab_size)
+            logits: Tensor of shape matching hidden_states but with vocab_size as last dim
             aux_loss: Optional routing loss for training
         """
         if not self.use_dual_heads:
             # Original behavior
             return self.to_logits(hidden_states), None
         
-        batch_size, seq_len, hidden_dim = hidden_states.shape
+        # Handle 4D shape from MEGABYTE
+        original_shape = hidden_states.shape  # (batch, N, n, hidden_dim) where n includes start token
+        batch_size = original_shape[0]
+        
+        # Flatten to 3D for processing: (batch, N*n, hidden_dim)
+        hidden_flat = rearrange(hidden_states, 'b N n d -> b (N n) d')
+        seq_len = hidden_flat.shape[1]  # N*n (includes start tokens)
         
         # Get routing predictions
-        router_logits = self.router(hidden_states)  # (batch, seq_len, 2)
+        router_logits = self.router(hidden_flat)  # (batch, seq_len, 2)
         router_probs = F.softmax(router_logits, dim=-1)
         
-        # Compute both heads
-        music_logits = self.to_logits(hidden_states)  # Use original to_logits as music head
-        text_logits = self.text_head(hidden_states)
+        # Compute both heads on flattened input
+        music_logits = self.to_logits(hidden_flat)  # (batch, seq_len, vocab_size)
+        text_logits = self.text_head(hidden_flat)   # (batch, seq_len, vocab_size)
         
         aux_loss = None
         
         if target_ids is not None and self.training:
             # Oracle routing during training
-            # Create mask for text tokens
-            target_ids_flat = target_ids.view(-1)
-            is_text = torch.zeros(target_ids_flat.shape[0], dtype=torch.bool, device=target_ids.device)
-            for text_id in self.text_token_ids:
-                is_text |= (target_ids_flat == text_id)
-            is_text = is_text.view(batch_size, -1)
+            # Move text token IDs to correct device if needed
+            if self.text_token_ids_tensor.device != target_ids.device:
+                self.text_token_ids_tensor = self.text_token_ids_tensor.to(target_ids.device)
             
-            # Pad or truncate is_text to match seq_len if necessary
-            if is_text.shape[1] < seq_len:
-                is_text = F.pad(is_text, (0, seq_len - is_text.shape[1]), value=False)
-            elif is_text.shape[1] > seq_len:
-                is_text = is_text[:, :seq_len]
+            # Create mask for text tokens using broadcasting
+            target_ids_flat = target_ids.view(batch_size, -1)  # (batch, original_seq_len)
+            is_text_flat = (target_ids_flat.unsqueeze(2) == self.text_token_ids_tensor.unsqueeze(0).unsqueeze(0)).any(dim=2)
+            
+            # MEGABYTE adds start tokens, so we need to account for them
+            # The attended sequence has start tokens inserted at regular intervals
+            # For each window of size n-1 in the original, we get n tokens (with start token)
+            N = original_shape[1]  # number of windows
+            n = original_shape[2]  # window size (including start token)
+            
+            # Create expanded is_text mask that accounts for start tokens
+            is_text_expanded = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=hidden_states.device)
+            
+            # Map original positions to attended positions (skipping start token positions)
+            for window_idx in range(N):
+                # Original indices for this window
+                orig_start = window_idx * (n - 1)  # n-1 because start token is added
+                orig_end = min(orig_start + (n - 1), target_ids_flat.shape[1])
+                
+                # Attended indices for this window (skip position 0 which is start token)
+                attended_start = window_idx * n + 1  # +1 to skip start token
+                attended_end = window_idx * n + n
+                
+                if orig_end > orig_start:
+                    actual_window_size = orig_end - orig_start
+                    is_text_expanded[:, attended_start:attended_start + actual_window_size] = \
+                        is_text_flat[:, orig_start:orig_end]
             
             # Use oracle routing with einsum
-            # Convert boolean mask to float for einsum
-            text_mask = is_text.float().unsqueeze(-1)  # (batch, seq_len, 1)
-            music_mask = 1.0 - text_mask  # (batch, seq_len, 1)
+            text_mask = is_text_expanded.float()  # (batch, seq_len)
+            music_mask = 1.0 - text_mask  # (batch, seq_len)
             
             # logits = music_mask * music_logits + text_mask * text_logits
-            # Using einsum: 'bsv,bs->bsv' where v is vocab_size
-            logits = torch.einsum('bsv,bs->bsv', music_logits, music_mask.squeeze(-1)) + \
-                     torch.einsum('bsv,bs->bsv', text_logits, text_mask.squeeze(-1))
+            logits_flat = torch.einsum('bsv,bs->bsv', music_logits, music_mask) + \
+                          torch.einsum('bsv,bs->bsv', text_logits, text_mask)
             
-            # Compute auxiliary routing loss
-            router_targets = is_text.long()  # 0 for music, 1 for text
-            valid_mask = (target_ids.view(batch_size, -1)[:, :seq_len] != self.pad_token_id)
+            # Compute auxiliary routing loss - only on non-start-token positions
+            # Create mask for non-start-token positions
+            non_start_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=hidden_states.device)
+            for window_idx in range(N):
+                non_start_mask[:, window_idx * n] = False  # Mark start token positions
+            
+            # Also check for padding
+            valid_mask = non_start_mask  # Only consider non-start tokens
             
             if valid_mask.any():
                 aux_loss = F.cross_entropy(
-                    router_logits[valid_mask],
-                    router_targets[valid_mask],
+                    router_logits[valid_mask],  # Shape: (num_valid, 2)
+                    is_text_expanded.long()[valid_mask],  # Shape: (num_valid,)
                     reduction='mean'
                 )
             else:
                 aux_loss = torch.tensor(0.0, device=router_logits.device)
         else:
             # Inference or no oracle routing: use soft combination with einsum
-            # router_probs shape: (batch, seq_len, 2)
-            # Extract weights
             music_weight = router_probs[..., 0]  # (batch, seq_len)
             text_weight = router_probs[..., 1]   # (batch, seq_len)
             
             # Weighted combination using einsum
-            logits = torch.einsum('bsv,bs->bsv', music_logits, music_weight) + \
-                     torch.einsum('bsv,bs->bsv', text_logits, text_weight)
+            logits_flat = torch.einsum('bsv,bs->bsv', music_logits, music_weight) + \
+                          torch.einsum('bsv,bs->bsv', text_logits, text_weight)
+        
+        # Reshape logits back to original 4D shape
+        vocab_size = logits_flat.shape[-1]
+        logits = rearrange(logits_flat, 'b (N n) v -> b N n v', 
+                          N=original_shape[1], n=original_shape[2])
         
         return logits, aux_loss
 
