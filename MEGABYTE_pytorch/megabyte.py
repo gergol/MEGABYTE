@@ -722,10 +722,10 @@ class MEGABYTE(nn.Module):
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.float()
 
         # Use compute_logits instead of to_logits
-        logits, _ = self.compute_logits(tokens)
+        logits, router_loss = self.compute_logits(tokens)
         if use_cache:
-            return logits, cache
-        return logits
+            return logits, cache, router_loss
+        return logits, router_loss
 
     def forward(
         self,
@@ -931,9 +931,9 @@ class MEGABYTE(nn.Module):
             total_loss = main_loss
         
         if return_preds_and_labels:
-            return total_loss, preds, labels
+            return total_loss, preds, labels, aux_loss
         
-        return total_loss
+        return total_loss, aux_loss
 
     # def forward_inference_prompt(
     #     self,
