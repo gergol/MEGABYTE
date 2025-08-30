@@ -403,7 +403,8 @@ class Transformer(nn.Module):
 
 # main class
 
-class MEGABYTE_MultiHead(nn.Module):
+
+class MEGABYTE(nn.Module):
 
     def __init__(
         self,
@@ -424,10 +425,8 @@ class MEGABYTE_MultiHead(nn.Module):
         pos_emb: bool = False,
         flash_attn: bool = False,
         add_cross_attention: bool = False,
-        use_old_layout: bool = False,
+        use_old_layout: bool = False,  # this is temporarily necessary because in previous versions the ordering of the cross attention and ff layers in the transformer was different. This is only an issue when trying to load an old checkpoint preceeding this change
         criterion: Callable[[torch.Tensor, torch.Tensor, ...], torch.Tensor] = F.cross_entropy,
-        text_token_ids: Optional[Set[int]] = None,  # NEW: IDs of text tokens
-        use_dual_heads: bool = False,  # NEW: Enable dual head mode
     ):
         super().__init__()
 
@@ -509,112 +508,9 @@ class MEGABYTE_MultiHead(nn.Module):
             self.to_next_transformer_projections.append(proj)
             first_layer = False
 
-        # Handle dual heads configuration
-        self.use_dual_heads = use_dual_heads
-        self.text_token_ids = text_token_ids or set()
-        
-        if use_dual_heads:
-            # Music head (default) - keep as to_logits for backward compatibility
-            self.to_logits = nn.Linear(fine_dim, vocab_size)
-            
-            # Text head with additional capacity
-            self.text_head = nn.Sequential(
-                nn.Linear(fine_dim, fine_dim),
-                nn.LayerNorm(fine_dim),
-                nn.GELU(),
-                nn.Linear(fine_dim, vocab_size)
-            )
-            
-            # Router to predict if next token is text
-            self.router = nn.Sequential(
-                nn.Linear(fine_dim, fine_dim // 4),
-                nn.ReLU(),
-                nn.Linear(fine_dim // 4, 2)  # Binary: music vs text
-            )
-        else:
-            # Original single head
-            self.to_logits = nn.Linear(fine_dim, vocab_size)
-            
+        self.to_logits = nn.Linear(fine_dim, vocab_size)
         self.pad_token_id = pad_token_id
         self.criterion = criterion
-
-    def compute_logits(self, hidden_states, target_ids=None):
-        """
-        Convert hidden states to logits, with optional routing for text tokens.
-        
-        Args:
-            hidden_states: Tensor of shape (batch, seq_len, hidden_dim)
-            target_ids: Optional tensor of target token IDs for oracle routing during training
-        
-        Returns:
-            logits: Tensor of shape (batch, seq_len, vocab_size)
-            aux_loss: Optional routing loss for training
-        """
-        if not self.use_dual_heads:
-            # Original behavior
-            return self.to_logits(hidden_states), None
-        
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        
-        # Get routing predictions
-        router_logits = self.router(hidden_states)  # (batch, seq_len, 2)
-        router_probs = F.softmax(router_logits, dim=-1)
-        
-        # Compute both heads
-        music_logits = self.to_logits(hidden_states)  # Use original to_logits as music head
-        text_logits = self.text_head(hidden_states)
-        
-        aux_loss = None
-        
-        if target_ids is not None and self.training:
-            # Oracle routing during training
-            # Create mask for text tokens
-            target_ids_flat = target_ids.view(-1)
-            is_text = torch.zeros(target_ids_flat.shape[0], dtype=torch.bool, device=target_ids.device)
-            for text_id in self.text_token_ids:
-                is_text |= (target_ids_flat == text_id)
-            is_text = is_text.view(batch_size, -1)
-            
-            # Pad or truncate is_text to match seq_len if necessary
-            if is_text.shape[1] < seq_len:
-                is_text = F.pad(is_text, (0, seq_len - is_text.shape[1]), value=False)
-            elif is_text.shape[1] > seq_len:
-                is_text = is_text[:, :seq_len]
-            
-            # Use oracle routing with einsum
-            # Convert boolean mask to float for einsum
-            text_mask = is_text.float().unsqueeze(-1)  # (batch, seq_len, 1)
-            music_mask = 1.0 - text_mask  # (batch, seq_len, 1)
-            
-            # logits = music_mask * music_logits + text_mask * text_logits
-            # Using einsum: 'bsv,bs->bsv' where v is vocab_size
-            logits = torch.einsum('bsv,bs->bsv', music_logits, music_mask.squeeze(-1)) + \
-                     torch.einsum('bsv,bs->bsv', text_logits, text_mask.squeeze(-1))
-            
-            # Compute auxiliary routing loss
-            router_targets = is_text.long()  # 0 for music, 1 for text
-            valid_mask = (target_ids.view(batch_size, -1)[:, :seq_len] != self.pad_token_id)
-            
-            if valid_mask.any():
-                aux_loss = F.cross_entropy(
-                    router_logits[valid_mask],
-                    router_targets[valid_mask],
-                    reduction='mean'
-                )
-            else:
-                aux_loss = torch.tensor(0.0, device=router_logits.device)
-        else:
-            # Inference or no oracle routing: use soft combination with einsum
-            # router_probs shape: (batch, seq_len, 2)
-            # Extract weights
-            music_weight = router_probs[..., 0]  # (batch, seq_len)
-            text_weight = router_probs[..., 1]   # (batch, seq_len)
-            
-            # Weighted combination using einsum
-            logits = torch.einsum('bsv,bs->bsv', music_logits, music_weight) + \
-                     torch.einsum('bsv,bs->bsv', text_logits, text_weight)
-        
-        return logits, aux_loss
 
     def generate(self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1):
         total_seq_len = reduce_mult(self.max_sequence_lengths)
@@ -684,11 +580,9 @@ class MEGABYTE_MultiHead(nn.Module):
             if use_cache and stage_idx < self.depth - 1:
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.float()
 
-        # Use compute_logits instead of to_logits
-        logits, _ = self.compute_logits(tokens)
         if use_cache:
-            return logits, cache
-        return logits
+            return self.to_logits(tokens), cache  # type: ignore
+        return self.to_logits(tokens)  # type: ignore
 
     def forward(
         self,
@@ -835,21 +729,32 @@ class MEGABYTE_MultiHead(nn.Module):
 
             stage_cache = cache["kv"][stage_idx] if cache else None
             inspect_shapes(f"stage tokens to transormer {stage_idx}", stage_tokens=stage_tokens[-1:])
-
+            # if DO_HACK:
+            #     # TODO this only works for batch size 1 and only during inference without prompt
+            #     stage_tokens = stage_tokens[-1].unsqueeze(0)
             if first_stage and self.add_cross_attention:
                 attended, stage_cache = transformer(
                     stage_tokens, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=stage_cache
                 )
             else:
                 attended, stage_cache = transformer(stage_tokens, use_cache=use_cache, cache=stage_cache, debug=False)
-
+            # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
+            # print("before unpacking: ps: ", ps)
             attended = unpack_one(attended, ps, "* n d")
+            # inspect_shapes(f"attention UNPACKED output stage {stage_idx}", attended_unpacked=attended)
 
             # project for next stage in the hierarchy
 
             inspect_shapes("to_next_layer_proj", print_values=True, to_next_layer=attended[..., :-1, :])
             prev_stage_tokens_repr = proj(attended[..., :-1, :])
 
+            # if not self.training:
+            #     print("BAMMM")
+            #     # TODO: this is for testing only as it will break handling longer input prompts
+            #     # it will onlhy work for token by token inference
+            #     prev_stage_tokens_repr = prev_stage_tokens_repr[-1]
+
+            # inspect_shapes(f"attention PROJECTED output stage {stage_idx}", proj=prev_stage_tokens_repr)
             if use_cache:
                 cache["kv"][stage_idx] = stage_cache
             if use_cache and stage_idx < self.depth - 1:
@@ -858,10 +763,9 @@ class MEGABYTE_MultiHead(nn.Module):
             if do_profile:
                 cache["profile"][stage_idx].append(time.time() - start_time)
 
-        # project to logits with routing
-        # Save original ids shape for routing
-        original_ids = ids.view(batch, -1) if flattened_dims else ids.view(batch, -1)
-        logits, aux_loss = self.compute_logits(attended, target_ids=original_ids if self.training else None)
+        # project to logits
+
+        logits = self.to_logits(attended)
 
         start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
         start_tokens = rearrange(start_tokens, "b d -> b 1 d")
@@ -884,229 +788,222 @@ class MEGABYTE_MultiHead(nn.Module):
 
         preds = rearrange(logits, "b n c -> b c n")
         labels = rearrange(ids, "b ... -> b (...)")
-        
-        # Compute main loss
-        main_loss = self.criterion(preds[..., :-1], labels, ignore_index=self.pad_token_id) 
-        # Combine with auxiliary routing loss if available
-        if aux_loss is not None and self.use_dual_heads:
-            total_loss = main_loss + 0.1 * aux_loss  # Weight the routing loss
-        else:
-            total_loss = main_loss
-        
-        if return_preds_and_labels:
-            return total_loss, preds, labels
-        
-        return total_loss
 
-    # def forward_inference_prompt(
-    #     self,
-    #     ids,
-    #     return_loss=False,
-    #     encoder_hidden_states=None,
-    #     return_preds_and_labels=False,
-    #     use_cache=False,
-    #     cache: Optional[Dict] = None,
-    #     profile: bool = False,
-    #     streaming=True,
-    # ):
-    #     batch = ids.shape[0]
-    #     N = ids.shape[1]
-    #
-    #     assert use_cache or cache is None, "You must not provide a cache when use_cache=False"
-    #     # print("\n\nCALLING MEGABYTE FORWARD", ids.shape)
-    #     # inspect_shapes("MEGABYTE", ids=ids)
-    #     assert ids.ndim in {2, self.stages + 1}
-    #     assert self.add_cross_attention == (
-    #         encoder_hidden_states is not None
-    #     ), "encoder_hidden_states are expected if and only if self.add_cross_attention == True"
-    #
-    #     assert not use_cache or self.depth == 2, "cache is only implemented for two-layer MEGABYTE models"
-    #     assert (
-    #         not use_cache or len(ids.shape) == 2 and batch == 1
-    #     ), "caching is curently only supported for batch size == 1"
-    #
-    #     flattened_dims = ids.ndim == 2
-    #
-    #     # if we are streaming and it's not the first token / run
-    #     is_streaming_continued = streaming and cache is not None
-    #
-    #     if use_cache and cache is None:
-    #         cache = {}
-    #         cache["kv"] = [None] * len(self.transformers)
-    #         cache["hidden_states"] = [None] * (self.depth - 1)
-    #         if profile:
-    #             cache["profile"] = [[] for _ in range(self.depth)]
-    #
-    #     do_profile = cache is not None and "profile" in cache
-    #     if ids.numel() == 0:
-    #         return self.forward_empty(
-    #             ids.shape[0], encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
-    #         )
-    #
-    #     if flattened_dims:
-    #         # allow for ids to be given in the shape of (batch, seq)
-    #         # in which case it will be auto-padded to the next nearest multiple of depth seq len
-    #         seq_len = ids.shape[-1]
-    #         multiple_of = reduce_mult(self.max_sequence_lengths[1:])
-    #         padding = remainder_to_mult(seq_len, multiple_of)
-    #         ids = F.pad(ids, (0, padding), value=self.pad_token_id)
-    #         ids = ids.reshape(batch, -1, *self.max_sequence_lengths[1:])
-    #
-    #     b, *prec_dims, device = *ids.shape, ids.device
-    #
-    #     # check some dimensions
-    #
-    #     assert (
-    #         prec_dims[0] <= self.max_sequence_lengths[0]
-    #     ), "the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_sequence_lengths (like any autoregressive transformer)"
-    #     assert tuple(prec_dims[1:]) == tuple(
-    #         self.max_sequence_lengths[1:]
-    #     ), "all subsequent dimensions must match exactly"
-    #
-    #     # get tokens for all hierarchical stages, reducing by appropriate dimensions
-    #     # and adding the absolute positional embeddings
-    #
-    #     tokens_at_stages = []
-    #     pos_embs = default(self.pos_embs, (None,))
-    #
-    #     for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
-    #         is_first = stage_idx == 0
-    #
-    #         tokens = token_emb(ids)
-    #
-    #         if exists(pos_emb):
-    #             positions = pos_emb(torch.arange(tokens.shape[-2], device=device))
-    #             tokens = tokens + positions
-    #
-    #         tokens_at_stages.insert(0, tokens)
-    #
-    #         if is_first:
-    #             continue
-    #
-    #         ids = rearrange(ids, "... m n -> ... (m n)")
-    #
-    #     # the un-pixelshuffled representations of the previous hierarchy, starts with None
-    #
-    #     prev_stage_tokens_repr = None
-    #
-    #     # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
-    #     first_stage = True
-    #     for stage_idx, stage_start_tokens, stage_tokens, transformer, proj in zip(
-    #         range(self.depth),
-    #         self.start_tokens,
-    #         tokens_at_stages,
-    #         self.transformers,
-    #         self.to_next_transformer_projections,
-    #     ):
-    #         if do_profile:
-    #             start_time = time.time()
-    #         # if use_cache and stage_idx < len(cache["hidden_states"]):
-    #         #     hs = cache["hidden_states"][stage_idx]
-    #         #     # for networks with higer depth, we need to change this by the product of the subsequent layers
-    #         #     scale_factor = self.max_sequence_lengths[stage_idx + 1]
-    #         #     # if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
-    #         #     if hs is not None and (tok_idx_in_seq + 1) % scale_factor == 0:
-    #         #         # we have cached values for the current step, so we can skip that forward pass
-    #         #         prev_stage_tokens_repr = hs
-    #         #         if do_profile:
-    #         #             cache["profile"][stage_idx].append(time.time() - start_time)
-    #         #         continue
-    #         #     print("NOT USING HS CACHE")
-    #         #     # if hs is not None:
-    #
-    #         stage_tokens, ps = pack_one(stage_tokens, "* n d")
-    #
-    #         # if not is_streaming_continued:
-    #         stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
-    #
-    #         # concat start token
-    #         stage_tokens = torch.cat(
-    #             (
-    #                 stage_start_tokens,
-    #                 stage_tokens,
-    #             ),
-    #             dim=-2,
-    #         )
-    #         dprint("stage_tokens", stage_tokens)
-    #
-    #         # sum the previous hierarchy's representation
-    #         if exists(prev_stage_tokens_repr):
-    #             prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
-    #             stage_tokens = stage_tokens + prev_stage_tokens_repr
-    #
-    #         stage_cache = cache["kv"][stage_idx] if cache else None
-    #         # inspect_shapes(f"stage tokens to transormer {stage_idx}", stage_tokens=stage_tokens)
-    #         # if DO_HACK:
-    #         #     # TODO this only works for batch size 1 and only during inference without prompt
-    #         #     stage_tokens = stage_tokens[-1].unsqueeze(0)
-    #
-    #         if first_stage and self.add_cross_attention:
-    #             attended, stage_cache = transformer(
-    #                 stage_tokens,
-    #                 encoder_hidden_states=encoder_hidden_states,
-    #                 use_cache=False,
-    #             )
-    #         else:
-    #             attended, stage_cache = transformer(
-    #                 stage_tokens,
-    #                 use_cache=False,
-    #             )
-    #         # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
-    #         # print("before unpacking: ps: ", ps)
-    #         attended = unpack_one(attended, ps, "* n d")
-    #         # inspect_shapes(f"attention UNPACKED output stage {stage_idx}", attended_unpacked=attended)
-    #
-    #         # project for next stage in the hierarchy
-    #
-    #         prev_stage_tokens_repr = proj(attended[..., :-1, :])
-    #
-    #         # if not self.training:
-    #         #     print("BAMMM")
-    #         #     # TODO: this is for testing only as it will break handling longer input prompts
-    #         #     # it will onlhy work for token by token inference
-    #         #     prev_stage_tokens_repr = prev_stage_tokens_repr[-1]
-    #
-    #         # inspect_shapes(f"attention PROJECTED output stage {stage_idx}", proj=prev_stage_tokens_repr)
-    #         if use_cache and first_stage:
-    #             # inspect_shapes(f"out KV of stage {stage_idx}", k=stage_cache[0]["k"])
-    #             cache["kv"][stage_idx] = stage_cache
-    #         if use_cache and stage_idx < self.depth - 1:
-    #             cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
-    #             # inspect_shapes(f"out HS of stage {stage_idx}", hs=cache["hidden_states"][stage_idx])
-    #         first_stage = False
-    #         if do_profile:
-    #             cache["profile"][stage_idx].append(time.time() - start_time)
-    #
-    #     # project to logits
-    #
-    #     logits = self.to_logits(attended)
-    #
-    #     start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
-    #     start_tokens = rearrange(start_tokens, "b d -> b 1 d")
-    #
-    #     logits = logits[..., 1:, :]
-    #
-    #     if not return_loss:
-    #
-    #         if flattened_dims:
-    #             logits = rearrange(logits, "b ... c -> b (...) c")
-    #             logits = logits[:, :seq_len]
-    #
-    #         if use_cache:
-    #             return logits, cache
-    #         return logits
-    #
-    #     logits = rearrange(logits, "b ... c -> b (...) c")
-    #     logits = torch.cat((start_tokens, logits), dim=-2)
-    #
-    #     preds = rearrange(logits, "b n c -> b c n")
-    #     labels = rearrange(ids, "b ... -> b (...)")
-    #
-    #     loss = self.criterion(preds[..., :-1], labels, ignore_index=self.pad_token_id)
-    #
-    #     if return_preds_and_labels:
-    #         return loss, preds, labels
-    #     return loss
+        loss = self.criterion(preds[..., :-1], labels, ignore_index=self.pad_token_id)
+
+        if return_preds_and_labels:
+            return loss, preds, labels
+        return loss
+
+    def forward_inference_prompt(
+        self,
+        ids,
+        return_loss=False,
+        encoder_hidden_states=None,
+        return_preds_and_labels=False,
+        use_cache=False,
+        cache: Optional[Dict] = None,
+        profile: bool = False,
+        streaming=True,
+    ):
+        batch = ids.shape[0]
+        N = ids.shape[1]
+
+        assert use_cache or cache is None, "You must not provide a cache when use_cache=False"
+        # print("\n\nCALLING MEGABYTE FORWARD", ids.shape)
+        # inspect_shapes("MEGABYTE", ids=ids)
+        assert ids.ndim in {2, self.stages + 1}
+        assert self.add_cross_attention == (
+            encoder_hidden_states is not None
+        ), "encoder_hidden_states are expected if and only if self.add_cross_attention == True"
+
+        assert not use_cache or self.depth == 2, "cache is only implemented for two-layer MEGABYTE models"
+        assert (
+            not use_cache or len(ids.shape) == 2 and batch == 1
+        ), "caching is curently only supported for batch size == 1"
+
+        flattened_dims = ids.ndim == 2
+
+        # if we are streaming and it's not the first token / run
+        is_streaming_continued = streaming and cache is not None
+
+        if use_cache and cache is None:
+            cache = {}
+            cache["kv"] = [None] * len(self.transformers)
+            cache["hidden_states"] = [None] * (self.depth - 1)
+            if profile:
+                cache["profile"] = [[] for _ in range(self.depth)]
+
+        do_profile = cache is not None and "profile" in cache
+        if ids.numel() == 0:
+            return self.forward_empty(
+                ids.shape[0], encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache
+            )
+
+        if flattened_dims:
+            # allow for ids to be given in the shape of (batch, seq)
+            # in which case it will be auto-padded to the next nearest multiple of depth seq len
+            seq_len = ids.shape[-1]
+            multiple_of = reduce_mult(self.max_sequence_lengths[1:])
+            padding = remainder_to_mult(seq_len, multiple_of)
+            ids = F.pad(ids, (0, padding), value=self.pad_token_id)
+            ids = ids.reshape(batch, -1, *self.max_sequence_lengths[1:])
+
+        b, *prec_dims, device = *ids.shape, ids.device
+
+        # check some dimensions
+
+        assert (
+            prec_dims[0] <= self.max_sequence_lengths[0]
+        ), "the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_sequence_lengths (like any autoregressive transformer)"
+        assert tuple(prec_dims[1:]) == tuple(
+            self.max_sequence_lengths[1:]
+        ), "all subsequent dimensions must match exactly"
+
+        # get tokens for all hierarchical stages, reducing by appropriate dimensions
+        # and adding the absolute positional embeddings
+
+        tokens_at_stages = []
+        pos_embs = default(self.pos_embs, (None,))
+
+        for stage_idx, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
+            is_first = stage_idx == 0
+
+            tokens = token_emb(ids)
+
+            if exists(pos_emb):
+                positions = pos_emb(torch.arange(tokens.shape[-2], device=device))
+                tokens = tokens + positions
+
+            tokens_at_stages.insert(0, tokens)
+
+            if is_first:
+                continue
+
+            ids = rearrange(ids, "... m n -> ... (m n)")
+
+        # the un-pixelshuffled representations of the previous hierarchy, starts with None
+
+        prev_stage_tokens_repr = None
+
+        # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
+        first_stage = True
+        for stage_idx, stage_start_tokens, stage_tokens, transformer, proj in zip(
+            range(self.depth),
+            self.start_tokens,
+            tokens_at_stages,
+            self.transformers,
+            self.to_next_transformer_projections,
+        ):
+            if do_profile:
+                start_time = time.time()
+            # if use_cache and stage_idx < len(cache["hidden_states"]):
+            #     hs = cache["hidden_states"][stage_idx]
+            #     # for networks with higer depth, we need to change this by the product of the subsequent layers
+            #     scale_factor = self.max_sequence_lengths[stage_idx + 1]
+            #     # if hs is not None and hs.shape[0] * scale_factor >= ids.shape[-1]:
+            #     if hs is not None and (tok_idx_in_seq + 1) % scale_factor == 0:
+            #         # we have cached values for the current step, so we can skip that forward pass
+            #         prev_stage_tokens_repr = hs
+            #         if do_profile:
+            #             cache["profile"][stage_idx].append(time.time() - start_time)
+            #         continue
+            #     print("NOT USING HS CACHE")
+            #     # if hs is not None:
+
+            stage_tokens, ps = pack_one(stage_tokens, "* n d")
+
+            # if not is_streaming_continued:
+            stage_start_tokens = repeat(stage_start_tokens, "f -> b 1 f", b=stage_tokens.shape[0])
+
+            # concat start token
+            stage_tokens = torch.cat(
+                (
+                    stage_start_tokens,
+                    stage_tokens,
+                ),
+                dim=-2,
+            )
+            dprint("stage_tokens", stage_tokens)
+
+            # sum the previous hierarchy's representation
+            if exists(prev_stage_tokens_repr):
+                prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value=0.0)
+                stage_tokens = stage_tokens + prev_stage_tokens_repr
+
+            stage_cache = cache["kv"][stage_idx] if cache else None
+            # inspect_shapes(f"stage tokens to transormer {stage_idx}", stage_tokens=stage_tokens)
+            # if DO_HACK:
+            #     # TODO this only works for batch size 1 and only during inference without prompt
+            #     stage_tokens = stage_tokens[-1].unsqueeze(0)
+
+            if first_stage and self.add_cross_attention:
+                attended, stage_cache = transformer(
+                    stage_tokens,
+                    encoder_hidden_states=encoder_hidden_states,
+                    use_cache=False,
+                )
+            else:
+                attended, stage_cache = transformer(
+                    stage_tokens,
+                    use_cache=False,
+                )
+            # inspect_shapes(f"attention output stage {stage_idx}", attended=attended)
+            # print("before unpacking: ps: ", ps)
+            attended = unpack_one(attended, ps, "* n d")
+            # inspect_shapes(f"attention UNPACKED output stage {stage_idx}", attended_unpacked=attended)
+
+            # project for next stage in the hierarchy
+
+            prev_stage_tokens_repr = proj(attended[..., :-1, :])
+
+            # if not self.training:
+            #     print("BAMMM")
+            #     # TODO: this is for testing only as it will break handling longer input prompts
+            #     # it will onlhy work for token by token inference
+            #     prev_stage_tokens_repr = prev_stage_tokens_repr[-1]
+
+            # inspect_shapes(f"attention PROJECTED output stage {stage_idx}", proj=prev_stage_tokens_repr)
+            if use_cache and first_stage:
+                # inspect_shapes(f"out KV of stage {stage_idx}", k=stage_cache[0]["k"])
+                cache["kv"][stage_idx] = stage_cache
+            if use_cache and stage_idx < self.depth - 1:
+                cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.detach().clone()
+                # inspect_shapes(f"out HS of stage {stage_idx}", hs=cache["hidden_states"][stage_idx])
+            first_stage = False
+            if do_profile:
+                cache["profile"][stage_idx].append(time.time() - start_time)
+
+        # project to logits
+
+        logits = self.to_logits(attended)
+
+        start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
+        start_tokens = rearrange(start_tokens, "b d -> b 1 d")
+
+        logits = logits[..., 1:, :]
+
+        if not return_loss:
+
+            if flattened_dims:
+                logits = rearrange(logits, "b ... c -> b (...) c")
+                logits = logits[:, :seq_len]
+
+            if use_cache:
+                return logits, cache
+            return logits
+
+        logits = rearrange(logits, "b ... c -> b (...) c")
+        logits = torch.cat((start_tokens, logits), dim=-2)
+
+        preds = rearrange(logits, "b n c -> b c n")
+        labels = rearrange(ids, "b ... -> b (...)")
+
+        loss = self.criterion(preds[..., :-1], labels, ignore_index=self.pad_token_id)
+
+        if return_preds_and_labels:
+            return loss, preds, labels
+        return loss
 
     def embed_tokens(self, ids, prompt=False):
 
@@ -1287,7 +1184,7 @@ class MEGABYTE_MultiHead(nn.Module):
 
         set_cache(cache, "prev_stage_tokens_repr", cache["hidden_states"][0])
 
-        logits = self.compute_logits(attended)
+        logits = self.to_logits(attended)
 
         logits_idx = ((tok_idx_in_seq - 1) % self.max_sequence_lengths[-1]) + 1
         inspect_shapes("output raw", print_values=False, logits=logits.round(decimals=2), attended=attended)
