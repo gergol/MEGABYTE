@@ -543,7 +543,7 @@ class MEGABYTE(nn.Module):
         self.pad_token_id = pad_token_id
         self.criterion = criterion
 
-    def compute_logits(self, hidden_states, target_ids=None):
+    def compute_logits(self, hidden_states, target_ids=None, force_music=False, force_text=False):
         """
         Convert hidden states to logits, with optional routing for text tokens.
         
@@ -579,6 +579,10 @@ class MEGABYTE(nn.Module):
         # Compute both heads on flattened input
         music_logits = self.to_logits(hidden_flat)  # (batch, seq_len, vocab_size)
         text_logits = self.text_head(hidden_flat)   # (batch, seq_len, vocab_size)
+        if force_music:
+            return music_logits, None
+        if force_text:
+            return text_logits, None
         
         aux_loss = None
         
@@ -652,13 +656,13 @@ class MEGABYTE(nn.Module):
         
         # Reshape logits back to original 4D shape
         vocab_size = logits_flat.shape[-1]
-        if len(original_shape) == 4:
-            logits = rearrange(logits_flat, 'b (N n) v -> b N n v', 
-                              N=original_shape[1], n=original_shape[2])
-        else:
-            logits = logits_flat.unsqueeze(1)
+        # if len(original_shape) == 4:
+        #     logits = rearrange(logits_flat, 'b (N n) v -> b N n v', 
+        #                       N=original_shape[1], n=original_shape[2])
+        # else:
+        #     logits = logits_flat.unsqueeze(1)
         
-        return logits, aux_loss
+        return logits_flat, aux_loss
 
     def generate(self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1):
         total_seq_len = reduce_mult(self.max_sequence_lengths)
@@ -729,7 +733,7 @@ class MEGABYTE(nn.Module):
                 cache["hidden_states"][stage_idx] = prev_stage_tokens_repr.float()
 
         # Use compute_logits instead of to_logits
-        logits, router_loss = self.compute_logits(tokens)
+        logits, router_loss = self.compute_logits(tokens, force_music=True)
         if use_cache:
             return logits, cache, router_loss
         return logits, router_loss
@@ -1231,19 +1235,21 @@ class MEGABYTE(nn.Module):
         use_cache=False,
         cache: Optional[Dict] = None,
         profile: bool = False,
+        force_music: bool = False,
+        force_text: bool = False
     ):
         dprint("input ids: ", ids)
         batch = ids.shape[0]
         seq_len = ids.shape[-1]
 
         run_prompt = seq_len > 0 and cache is None
-        logits, cache = self._forward_inference_impl(
-            ids=ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile
+        logits, cache, _ = self._forward_inference_impl(
+            ids=ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile, force_music=force_music, force_text=force_text
         )
         if run_prompt and seq_len % self.max_sequence_lengths[-1] == 0:
 
-            logits, cache = self._forward_inference_impl(
-                ids=ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile
+            logits, cache, _ = self._forward_inference_impl(
+                ids=ids, encoder_hidden_states=encoder_hidden_states, use_cache=use_cache, cache=cache, profile=profile, force_music=force_music, force_text=force_text
             )
 
         return logits, cache
@@ -1255,6 +1261,8 @@ class MEGABYTE(nn.Module):
         use_cache=False,
         cache: Optional[Dict] = None,
         profile: bool = False,
+        force_music: bool = False,
+        force_text: bool = False
     ):
         dprint("input ids: ", ids)
         batch = ids.shape[0]
@@ -1331,7 +1339,7 @@ class MEGABYTE(nn.Module):
 
         set_cache(cache, "prev_stage_tokens_repr", cache["hidden_states"][0])
 
-        logits, _ = self.compute_logits(attended)
+        logits, router_loss = self.compute_logits(attended, force_music=force_music, force_text=force_text)
 
         logits_idx = ((tok_idx_in_seq - 1) % self.max_sequence_lengths[-1]) + 1
         inspect_shapes("output raw", print_values=False, logits=logits.round(decimals=2), attended=attended)
@@ -1341,7 +1349,7 @@ class MEGABYTE(nn.Module):
             logits = logits[:, :seq_len]
         inspect_shapes("output", logits=logits.round(decimals=2))
 
-        return logits, cache
+        return logits, cache, router_loss
 
     def forward_stage(
         self,
