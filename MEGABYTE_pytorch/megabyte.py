@@ -652,8 +652,11 @@ class MEGABYTE(nn.Module):
         
         # Reshape logits back to original 4D shape
         vocab_size = logits_flat.shape[-1]
-        logits = rearrange(logits_flat, 'b (N n) v -> b N n v', 
-                          N=original_shape[1], n=original_shape[2])
+        if len(original_shape) == 4:
+            logits = rearrange(logits_flat, 'b (N n) v -> b N n v', 
+                              N=original_shape[1], n=original_shape[2])
+        else:
+            logits = logits_flat.unsqueeze(1)
         
         return logits, aux_loss
 
@@ -1328,7 +1331,7 @@ class MEGABYTE(nn.Module):
 
         set_cache(cache, "prev_stage_tokens_repr", cache["hidden_states"][0])
 
-        logits = self.compute_logits(attended)
+        logits, _ = self.compute_logits(attended)
 
         logits_idx = ((tok_idx_in_seq - 1) % self.max_sequence_lengths[-1]) + 1
         inspect_shapes("output raw", print_values=False, logits=logits.round(decimals=2), attended=attended)
