@@ -560,12 +560,16 @@ class MEGABYTE(nn.Module):
             # Original behavior
             return self.to_logits(hidden_states), None
         
-        # Handle 4D shape from MEGABYTE
         original_shape = hidden_states.shape  # (batch, N, n, hidden_dim) where n includes start token
         batch_size = original_shape[0]
-        
-        # Flatten to 3D for processing: (batch, N*n, hidden_dim)
-        hidden_flat = rearrange(hidden_states, 'b N n d -> b (N n) d')
+
+        if len(original_shape) == 4:
+            # Handle 4D shape from MEGABYTE
+            # Flatten to 3D for processing: (batch, N*n, hidden_dim)
+            hidden_flat = rearrange(hidden_states, 'b N n d -> b (N n) d')
+        else:
+            assert len(original_shape) == 3
+            hidden_flat = hidden_states
         seq_len = hidden_flat.shape[1]  # N*n (includes start tokens)
         
         # Get routing predictions
